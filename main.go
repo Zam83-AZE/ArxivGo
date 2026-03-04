@@ -4,12 +4,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -32,14 +35,20 @@ type AppState struct {
 	mu    sync.RWMutex
 }
 
+// Frontend-ə yalnız lazım olan dataları göndərmək üçün
+type MetaResponse struct {
+	Recents        []FileData `json:"recents"`
+	VirtualFolders []string   `json:"folders"`
+	TotalFiles     int        `json:"totalFiles"`
+}
+
 const dbPath = "data.json"
-const storageFolder = "ArxivGo_Storage" // Faylların əlavə olunacağı ortaq qovluq
+const storageFolder = "ArxivGo_Storage"
 var state AppState
 
 // --- BACKEND MƏNTİQİ ---
 
 func initStorage() {
-	// Proqram açılanda ortaq fayl qovluğu yoxdursa, yaradırıq.
 	if _, err := os.Stat(storageFolder); os.IsNotExist(err) {
 		os.MkdirAll(storageFolder, 0755)
 	}
@@ -60,16 +69,21 @@ func loadDB() {
 
 func saveDB() {
 	state.mu.RLock()
-	data, _ := json.MarshalIndent(state.Files, "", "  ")
+	// JSON yazılarkən server donmasın deyə məlumatı kopyalayırıq
+	dataCopy := make([]FileData, len(state.Files))
+	copy(dataCopy, state.Files)
 	state.mu.RUnlock()
+
+	// MarshalIndent əvəzinə Marshal (Fayl ölçüsünü xeyli kiçildir və daha sürətlidir)
+	data, _ := json.Marshal(dataCopy)
 	os.WriteFile(dbPath, data, 0644)
 }
 
-// --- AVTOMATİK SKAN VƏ BÜTÜN DİSKLƏRİ AŞKARLAMA ---
+// --- SÜRƏTLİ SKAN (WalkDir ilə) ---
 
 func performScan(pathsToScan []string) {
 	state.mu.RLock()
-	existingFiles := make(map[string]bool)
+	existingFiles := make(map[string]bool, len(state.Files))
 	for _, f := range state.Files {
 		existingFiles[f.Path] = true
 	}
@@ -78,15 +92,14 @@ func performScan(pathsToScan []string) {
 	var newFiles []FileData
 
 	for _, dir := range pathsToScan {
-		filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return nil
-			}
-
-			// Ağır qovluqları keç ki, proqram donmasın
-			if info.IsDir() {
-				name := info.Name()
-				if name == ".git" || name == "node_modules" || name == "Windows" || name == "AppData" {
+		// Sürətli skan üçün filepath.WalkDir istifadə olunur (Go 1.16+)
+		filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+			if err != nil { return nil }
+			
+			if d.IsDir() {
+				name := d.Name()
+				// Skan edilməyəcək ağır sistem qovluqları
+				if name == ".git" || name == "node_modules" || name == "Windows" || name == "AppData" || name == "sys" {
 					return filepath.SkipDir
 				}
 				return nil
@@ -95,7 +108,7 @@ func performScan(pathsToScan []string) {
 			if !existingFiles[path] {
 				newFiles = append(newFiles, FileData{
 					ID:        fmt.Sprintf("%d", time.Now().UnixNano()),
-					Name:      info.Name(),
+					Name:      d.Name(),
 					Path:      path,
 					Tags:      []string{},
 					CreatedAt: time.Now(),
@@ -110,18 +123,18 @@ func performScan(pathsToScan []string) {
 		state.mu.Lock()
 		state.Files = append(state.Files, newFiles...)
 		state.mu.Unlock()
-		saveDB()
+		
+		// DB yazma əməliyyatını arxa fonda (goroutine) edirik ki, proqram dayanmasın
+		go saveDB()
 		fmt.Printf("✅ Skan bitdi: %d yeni fayl tapıldı!\n", len(newFiles))
 	}
 }
 
 func autoStartupScan() {
 	var pathsToScan []string
-	pathsToScan = append(pathsToScan, "./") // Cari qovluq (və Storage) həmişə skan edilir
+	pathsToScan = append(pathsToScan, "./")
 
 	if runtime.GOOS == "windows" {
-		// Windows üçün A-dan Z-yə bütün diskləri yoxlayır
-		fmt.Println("🔍 Windows diskləri axtarılır...")
 		for c := 'A'; c <= 'Z'; c++ {
 			drivePath := string(c) + ":\\"
 			if _, err := os.Stat(drivePath); err == nil {
@@ -129,7 +142,6 @@ func autoStartupScan() {
 			}
 		}
 	} else {
-		// Linux/Mac üçün ana qovluqlar
 		if _, err := os.Stat("/workspaces"); err == nil {
 			pathsToScan = append(pathsToScan, "/workspaces")
 		} else {
@@ -137,18 +149,103 @@ func autoStartupScan() {
 			pathsToScan = append(pathsToScan, filepath.Join(home, "Documents"), filepath.Join(home, "Desktop"), filepath.Join(home, "Downloads"))
 		}
 	}
-
-	fmt.Printf("📂 Skan ediləcək yollar: %v\n", pathsToScan)
 	performScan(pathsToScan)
 }
 
-// --- API HANDLERS ---
+// --- YENİ OPTİMALLAŞDIRILMIŞ API HANDLERS ---
 
-func getFilesHandler(w http.ResponseWriter, r *http.Request) {
+// AXTARIŞ (Browseri yormamaq üçün axtarış serverdə edilir)
+func searchHandler(w http.ResponseWriter, r *http.Request) {
+	query := strings.ToLower(r.URL.Query().Get("q"))
+	folderFilter := r.URL.Query().Get("folder")
+	limit := 100 // Ekrana eyni anda ən çox 100 fayl qaytar
+	
+	var results []FileData
+	
 	state.mu.RLock()
 	defer state.mu.RUnlock()
+
+	for _, f := range state.Files {
+		// Qovluq filtri varsa yoxla
+		if folderFilter != "" && f.VFolder != folderFilter {
+			continue
+		}
+
+		// Axtarış sözü boşdursa, heç nə qaytarma (və ya hamısını qaytara bilərsiniz, amma 300K üçün təhlükəlidir)
+		if query != "" {
+			match := strings.Contains(strings.ToLower(f.Name), query)
+			if !match {
+				for _, t := range f.Tags {
+					if strings.Contains(strings.ToLower(t), query) {
+						match = true
+						break
+					}
+				}
+			}
+			if !match {
+				continue
+			}
+		}
+
+		results = append(results, f)
+		if len(results) >= limit {
+			break
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(state.Files)
+	json.NewEncoder(w).Encode(results)
+}
+
+// META DATA (Son oxunanlar və Virtual Qovluqları almaq üçün)
+func metaHandler(w http.ResponseWriter, r *http.Request) {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+
+	foldersMap := make(map[string]bool)
+	var recents []FileData
+
+	// Son əlavə olunan 10 faylı tapmaq üçün müvəqqəti siyahı yaradırıq
+	// 300K faylı tam sort etmək ağır olar deyə, sadəcə ən son 100-ə baxmaq da olar
+	// Lakin Go-da slice-ın sonundakılar adətən ən yenilərdir. Biz son 100-ü sort edirik.
+	var recentCandidates []FileData
+	if len(state.Files) > 100 {
+		recentCandidates = make([]FileData, 100)
+		copy(recentCandidates, state.Files[len(state.Files)-100:])
+	} else {
+		recentCandidates = make([]FileData, len(state.Files))
+		copy(recentCandidates, state.Files)
+	}
+
+	sort.Slice(recentCandidates, func(i, j int) bool {
+		return recentCandidates[i].CreatedAt.After(recentCandidates[j].CreatedAt)
+	})
+
+	if len(recentCandidates) > 10 {
+		recents = recentCandidates[:10]
+	} else {
+		recents = recentCandidates
+	}
+
+	for _, f := range state.Files {
+		if f.VFolder != "" {
+			foldersMap[f.VFolder] = true
+		}
+	}
+
+	var folders []string
+	for k := range foldersMap {
+		folders = append(folders, k)
+	}
+
+	resp := MetaResponse{
+		Recents:        recents,
+		VirtualFolders: folders,
+		TotalFiles:     len(state.Files),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
 
 func updateHandler(w http.ResponseWriter, r *http.Request) {
@@ -166,36 +263,24 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	state.mu.Unlock()
-	saveDB()
+	go saveDB() // Arxa fonda yaz ki, UI gözləməsin
 	w.WriteHeader(http.StatusOK)
 }
 
-// Yeni: Drag & Drop fayl yükləmə api-si
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
-	// Max 500 MB fayl qəbulu
 	err := r.ParseMultipartForm(500 << 20)
-	if err != nil {
-		http.Error(w, err.Error(), 400)
-		return
-	}
+	if err != nil { http.Error(w, err.Error(), 400); return }
 
 	file, handler, err := r.FormFile("file")
-	if err != nil {
-		http.Error(w, err.Error(), 400)
-		return
-	}
+	if err != nil { http.Error(w, err.Error(), 400); return }
 	defer file.Close()
 
 	tagsJSON := r.FormValue("tags")
 	vFolder := r.FormValue("vFolder")
 
-	// Faylı fiziki olaraq ArxivGo_Storage daxilinə yazırıq
 	destPath := filepath.Join(storageFolder, handler.Filename)
 	destFile, err := os.Create(destPath)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
+	if err != nil { http.Error(w, err.Error(), 500); return }
 	defer destFile.Close()
 
 	io.Copy(destFile, file)
@@ -205,7 +290,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		json.Unmarshal([]byte(tagsJSON), &tags)
 	}
 
-	absPath, _ := filepath.Abs(destPath) // Tam yolu (Absolute Path) alırıq
+	absPath, _ := filepath.Abs(destPath)
 
 	newFile := FileData{
 		ID:        fmt.Sprintf("%d", time.Now().UnixNano()),
@@ -219,18 +304,19 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	state.mu.Lock()
 	state.Files = append(state.Files, newFile)
 	state.mu.Unlock()
-	saveDB()
+	go saveDB()
 
 	w.WriteHeader(http.StatusOK)
 }
 
 func scanHandler(w http.ResponseWriter, r *http.Request) {
 	dir := r.URL.Query().Get("path")
-	if dir != "" {
-		performScan([]string{dir})
+	if dir != "" { 
+		go performScan([]string{dir}) // Skanda brauzeri dondurmamaq üçün arxa fonda
 	}
-	fmt.Fprint(w, "Scan completed")
+	fmt.Fprint(w, "Scan initiated")
 }
+
 func openFileHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	state.mu.Lock()
@@ -244,21 +330,17 @@ func openFileHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	state.mu.Unlock()
-	saveDB()
+	go saveDB()
 
 	if targetPath != "" {
-		// Ağıllı Açılış Məntiqi
 		switch runtime.GOOS {
-		case "windows":
-			// Lokal Windows-da birbaşa Word, Excel və s. açır (Donma olmadan - Start istifadə edirik)
+		case "windows": 
 			exec.Command("rundll32", "url.dll,FileProtocolHandler", targetPath).Start()
-			fmt.Fprint(w, "OS Opened")
-		case "darwin":
-			// Mac-da birbaşa sistem proqramında açır
+			fmt.Fprint(w, "Opened on Windows")
+		case "darwin":  
 			exec.Command("open", targetPath).Start()
-			fmt.Fprint(w, "OS Opened")
-		default:
-			// Linux və ya Codespace-də xəta verməsin deyə brauzerdə açır / yükləyir
+			fmt.Fprint(w, "Opened on Mac")
+		default:        
 			http.ServeFile(w, r, targetPath)
 		}
 	} else {
@@ -269,13 +351,14 @@ func openFileHandler(w http.ResponseWriter, r *http.Request) {
 // --- MAIN ---
 
 func main() {
-	initStorage() // Storage qovluğunu yoxla/yarat
+	initStorage()
 	loadDB()
 	go autoStartupScan()
 
-	http.HandleFunc("/api/files", getFilesHandler)
+	http.HandleFunc("/api/search", searchHandler) // YENİ: Server tərəfli axtarış
+	http.HandleFunc("/api/meta", metaHandler)     // YENİ: Metadata (Qovluqlar və Son əlavələr)
 	http.HandleFunc("/api/update", updateHandler)
-	http.HandleFunc("/api/upload", uploadHandler) // Yeni upload routu
+	http.HandleFunc("/api/upload", uploadHandler)
 	http.HandleFunc("/api/scan", scanHandler)
 	http.HandleFunc("/api/open", openFileHandler)
 
@@ -288,12 +371,13 @@ func main() {
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
+// --- UI (FRONTEND) ---
 const uiHTML = `
 <!DOCTYPE html>
 <html lang="az">
 <head>
     <meta charset="UTF-8">
-    <title>ArxivGo | Cross-Browser Drop</title>
+    <title>ArxivGo | Performance Edition</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
@@ -304,8 +388,6 @@ const uiHTML = `
         .modal-overlay { background: rgba(255, 255, 255, 0.98); backdrop-filter: blur(10px); z-index: 100; }
         .custom-scroll::-webkit-scrollbar { width: 4px; }
         .custom-scroll::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 10px; }
-        
-        /* Drop ekranının digər elementlərlə qarışmaması üçün */
         .drop-zone-active { z-index: 9999; opacity: 1; pointer-events: all; }
         .drop-zone-inactive { z-index: -1; opacity: 0; pointer-events: none; }
     </style>
@@ -323,15 +405,17 @@ const uiHTML = `
 
         <div class="w-full max-w-2xl px-6 relative z-10">
             <div v-if="!activeModal && !editingFile && !uploadingFile" class="text-center">
-                <h1 class="text-5xl font-light mb-10 select-none">Arxiv<span class="font-bold text-blue-600">Go</span></h1>
-                
+                <h1 class="text-5xl font-light mb-1 select-none">Arxiv<span class="font-bold text-blue-600">Go</span></h1>
+                <p class="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-10">Cəmi Fayl: {{ totalFiles }}</p>
+
                 <div class="search-container flex items-center bg-white border border-slate-200 rounded-full px-6 py-4 mb-8 transition-all shadow-sm">
                     <i data-lucide="search" class="w-5 h-5 text-slate-400 mr-4"></i>
-                    <input v-model="query" type="text" placeholder="Axtar və ya faylı ekrana at..." class="flex-1 outline-none text-lg bg-transparent">
+                    <input v-model="query" @input="onSearchInput" type="text" placeholder="Axtar və ya faylı ekrana at..." class="flex-1 outline-none text-lg bg-transparent">
+                    <div v-if="isSearching" class="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
                 </div>
 
-                <div v-if="query.length > 0" class="absolute w-full left-0 max-w-2xl mx-auto mt-[-20px] bg-white border border-slate-100 rounded-3xl shadow-2xl z-50 overflow-hidden text-left max-h-[60vh] custom-scroll overflow-y-auto">
-                    <div v-for="f in filteredFiles" :key="f.id" class="px-6 py-4 hover:bg-blue-50/50 flex justify-between items-center group cursor-pointer border-b border-slate-50 last:border-0">
+                <div v-if="searchResults.length > 0" class="absolute w-full left-0 max-w-2xl mx-auto mt-[-20px] bg-white border border-slate-100 rounded-3xl shadow-2xl z-50 overflow-hidden text-left max-h-[60vh] custom-scroll overflow-y-auto">
+                    <div v-for="f in searchResults" :key="f.id" class="px-6 py-4 hover:bg-blue-50/50 flex justify-between items-center group cursor-pointer border-b border-slate-50 last:border-0">
                         <div @click="openFile(f.id)" class="flex-1 flex items-center gap-4">
                             <i data-lucide="file" class="w-5 h-5 text-slate-300"></i>
                             <div>
@@ -391,13 +475,13 @@ const uiHTML = `
                 </div>
                 <div class="flex-1 overflow-y-auto custom-scroll">
                     <div v-if="activeModal === 'folders'" class="grid grid-cols-2 gap-3">
-                        <div v-for="v in virtualFolders" @click="query = v; activeModal = null" class="p-5 bg-slate-50 rounded-2xl border border-slate-100 hover:border-blue-400 hover:bg-blue-50 cursor-pointer transition">
+                        <div v-for="v in virtualFolders" @click="searchFolder(v)" class="p-5 bg-slate-50 rounded-2xl border border-slate-100 hover:border-blue-400 hover:bg-blue-50 cursor-pointer transition">
                             <i data-lucide="folder" class="w-5 h-5 text-blue-500 mb-2"></i>
                             <div class="text-sm font-bold text-slate-700">{{ v || 'Adsız' }}</div>
                         </div>
                     </div>
                     <div v-if="activeModal === 'recents'" class="space-y-3">
-                        <div v-for="f in recents" class="p-4 bg-slate-50 rounded-2xl flex justify-between items-center">
+                        <div v-for="f in recents" @click="openFile(f.id)" class="p-4 bg-slate-50 rounded-2xl flex justify-between items-center cursor-pointer hover:bg-blue-50 transition">
                             <span class="text-sm font-medium truncate w-64">{{ f.name }}</span>
                             <span class="text-[10px] text-slate-400 font-bold uppercase">{{ formatDate(f.createdAt) }}</span>
                         </div>
@@ -434,33 +518,67 @@ const uiHTML = `
     </div>
 
     <script>
+        window.addEventListener("dragover", function(e) { e.preventDefault(); }, false);
+        window.addEventListener("drop", function(e) { e.preventDefault(); }, false);
+
         const { createApp } = Vue
         createApp({
             data() {
                 return {
-                    files: [], query: '', activeModal: null, editingFile: null, newTag: '',
-                    dragActive: false, uploadingFile: null, uploadTags: [], uploadVFolder: ''
+                    query: '', 
+                    searchResults: [], // YENİ: Yalnız Go-dan gələn limitli nəticələr burada saxlanılır
+                    recents: [], 
+                    virtualFolders: [],
+                    totalFiles: 0,
+                    activeModal: null, 
+                    editingFile: null, 
+                    newTag: '',
+                    dragActive: false, 
+                    uploadingFile: null, 
+                    uploadTags: [], 
+                    uploadVFolder: '',
+                    searchTimeout: null, // YENİ: Debounce taymeri
+                    isSearching: false
                 }
             },
-            computed: {
-                filteredFiles() {
-                    return this.files.filter(f => 
-                        f.name.toLowerCase().includes(this.query.toLowerCase()) || 
-                        f.tags.some(t => t.toLowerCase().includes(this.query.toLowerCase())) ||
-                        (f.vFolder && f.vFolder.toLowerCase().includes(this.query.toLowerCase()))
-                    );
-                },
-                virtualFolders() { return [...new Set(this.files.map(f => f.vFolder).filter(v => v))]; },
-                recents() { return [...this.files].sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 10); }
-            },
             methods: {
-                async fetchFiles() {
-                    const res = await fetch('/api/files');
-                    this.files = await res.json() || [];
+                // UI AÇILANDA YALNIZ META DATALARI (Recents, Folders) ÇƏKİLİR
+                async fetchMeta() {
+                    const res = await fetch('/api/meta');
+                    const data = await res.json();
+                    if(data) {
+                        this.recents = data.recents || [];
+                        this.virtualFolders = data.folders || [];
+                        this.totalFiles = data.totalFiles || 0;
+                    }
+                },
+                // AXTARIŞA YAZAN KİMİ İŞƏ DÜŞƏN DEBOUNCE FUNKSİYASI
+                onSearchInput() {
+                    clearTimeout(this.searchTimeout);
+                    if (this.query.length === 0) {
+                        this.searchResults = [];
+                        this.isSearching = false;
+                        return;
+                    }
+                    this.isSearching = true;
+                    // İstifadəçi hərfi yazıb bitirdikdən 300ms sonra Go-ya sorğu gedir
+                    this.searchTimeout = setTimeout(async () => {
+                        const res = await fetch('/api/search?q=' + encodeURIComponent(this.query));
+                        this.searchResults = await res.json() || [];
+                        this.isSearching = false;
+                    }, 300);
+                },
+                async searchFolder(folderName) {
+                    this.activeModal = null;
+                    this.query = "Qovluq: " + folderName;
+                    this.isSearching = true;
+                    const res = await fetch('/api/search?folder=' + encodeURIComponent(folderName));
+                    this.searchResults = await res.json() || [];
+                    this.isSearching = false;
                 },
                 async openFile(id) {
-                    await fetch('/api/open?id=' + id);
-                    this.fetchFiles();
+                    window.open('/api/open?id=' + id, '_blank');
+                    // Linux/Codespace-də yeni tab açır, Windows .exe isə proqramı açır.
                 },
                 startEdit(file) {
                     this.editingFile = JSON.parse(JSON.stringify(file));
@@ -476,15 +594,14 @@ const uiHTML = `
                 async saveEdit() {
                     await fetch('/api/update', { method: 'POST', body: JSON.stringify(this.editingFile) });
                     this.editingFile = null;
-                    this.fetchFiles();
+                    this.fetchMeta();
+                    this.onSearchInput(); // Axtarış nəticəsini yenilə
                 },
                 
-                // MÜKƏMMƏL DRAG & DROP LOGİKASI (Firefox Dəstəkli)
                 onDragEnter(e) { e.preventDefault(); this.dragActive = true; },
                 onDragOver(e) { e.preventDefault(); this.dragActive = true; },
                 onDragLeave(e) { 
                     e.preventDefault(); 
-                    // Yalnız ekranın xaricinə çıxanda overlay-i bağla
                     if (!e.relatedTarget || e.relatedTarget.nodeName === "HTML") {
                         this.dragActive = false; 
                     }
@@ -515,7 +632,7 @@ const uiHTML = `
                     await fetch('/api/upload', { method: 'POST', body: formData });
                     
                     this.uploadingFile = null;
-                    this.fetchFiles();
+                    this.fetchMeta();
                 },
                 openModal(type) {
                     this.activeModal = type;
@@ -524,11 +641,9 @@ const uiHTML = `
                 formatDate(d) { return new Date(d).toLocaleDateString(); }
             },
             mounted() {
-                this.fetchFiles();
+                this.fetchMeta();
                 lucide.createIcons();
-                setInterval(this.fetchFiles, 3000);
 
-                // FIREFOX ÜÇÜN QLOBAL EVENT LISTENERLƏR
                 window.addEventListener('dragenter', this.onDragEnter);
                 window.addEventListener('dragover', this.onDragOver);
                 window.addEventListener('dragleave', this.onDragLeave);
