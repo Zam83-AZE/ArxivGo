@@ -43,9 +43,16 @@ type MetaResponse struct {
 	TotalFiles     int        `json:"totalFiles"`
 }
 
+// YENİ: Qeyd yaratmaq üçün model
+type NoteRequest struct {
+	Title   string   `json:"title"`
+	Content string   `json:"content"`
+	Tags    []string `json:"tags"`
+	VFolder string   `json:"vFolder"`
+}
+
 const dbPath = "data.json"
 const storageFolder = "ArxivGo_Storage"
-
 var state AppState
 
 // --- BACKEND MƏNTİQİ ---
@@ -85,7 +92,7 @@ func performScan(pathsToScan []string) {
 	state.mu.RLock()
 	existingPaths := make(map[string]bool, len(state.Files))
 	for _, f := range state.Files {
-		existingPaths[f.Path] = true // Path-ə görə yoxlayırıq
+		existingPaths[f.Path] = true
 	}
 	state.mu.RUnlock()
 
@@ -93,10 +100,8 @@ func performScan(pathsToScan []string) {
 
 	for _, dir := range pathsToScan {
 		filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return nil
-			}
-
+			if err != nil { return nil }
+			
 			if d.IsDir() {
 				name := d.Name()
 				if name == ".git" || name == "node_modules" || name == "Windows" || name == "AppData" || name == "sys" {
@@ -106,7 +111,6 @@ func performScan(pathsToScan []string) {
 			}
 
 			if !existingPaths[path] {
-				// YENİ: Faylın yoluna əsaslanan unikal MD5 Hash yaradırıq
 				hash := md5.Sum([]byte(path))
 				uniqueID := hex.EncodeToString(hash[:])
 
@@ -127,7 +131,7 @@ func performScan(pathsToScan []string) {
 		state.mu.Lock()
 		state.Files = append(state.Files, newFiles...)
 		state.mu.Unlock()
-
+		
 		go saveDB()
 		fmt.Printf("✅ Skan bitdi: %d yeni fayl tapıldı!\n", len(newFiles))
 	}
@@ -160,10 +164,10 @@ func autoStartupScan() {
 func searchHandler(w http.ResponseWriter, r *http.Request) {
 	query := strings.ToLower(r.URL.Query().Get("q"))
 	folderFilter := r.URL.Query().Get("folder")
-	limit := 100
-
+	limit := 100 
+	
 	var results []FileData
-
+	
 	state.mu.RLock()
 	defer state.mu.RUnlock()
 
@@ -182,15 +186,11 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
-			if !match {
-				continue
-			}
+			if !match { continue }
 		}
 
 		results = append(results, f)
-		if len(results) >= limit {
-			break
-		}
+		if len(results) >= limit { break }
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -259,22 +259,16 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	state.mu.Unlock()
-	go saveDB()
+	go saveDB() 
 	w.WriteHeader(http.StatusOK)
 }
 
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	err := r.ParseMultipartForm(500 << 20)
-	if err != nil {
-		http.Error(w, err.Error(), 400)
-		return
-	}
+	if err != nil { http.Error(w, err.Error(), 400); return }
 
 	file, handler, err := r.FormFile("file")
-	if err != nil {
-		http.Error(w, err.Error(), 400)
-		return
-	}
+	if err != nil { http.Error(w, err.Error(), 400); return }
 	defer file.Close()
 
 	tagsJSON := r.FormValue("tags")
@@ -282,10 +276,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	destPath := filepath.Join(storageFolder, handler.Filename)
 	destFile, err := os.Create(destPath)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
+	if err != nil { http.Error(w, err.Error(), 500); return }
 	defer destFile.Close()
 
 	io.Copy(destFile, file)
@@ -296,8 +287,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	absPath, _ := filepath.Abs(destPath)
-
-	// YENİ: Upload olan fayla da unikal ID veririk
+	
 	hash := md5.Sum([]byte(absPath))
 	uniqueID := hex.EncodeToString(hash[:])
 
@@ -318,10 +308,65 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// YENİ: Qeyd Yaratma (Create Note) Handleri
+func createNoteHandler(w http.ResponseWriter, r *http.Request) {
+	var req NoteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	// Fayl adı üçün başlığı təmizləyirik (boşluqları alt xətt ilə əvəz edirik)
+	safeTitle := strings.ReplaceAll(req.Title, " ", "_")
+	safeTitle = strings.ReplaceAll(safeTitle, "/", "-")
+	safeTitle = strings.ReplaceAll(safeTitle, "\\", "-")
+	
+	if safeTitle == "" {
+		safeTitle = "Adsiz_Qeyd"
+	}
+	
+	fileName := safeTitle + ".txt"
+	destPath := filepath.Join(storageFolder, fileName)
+
+	// Əgər eyni adlı qeyd varsa, sonuna vaxt (timestamp) artırırıq
+	if _, err := os.Stat(destPath); err == nil {
+		fileName = fmt.Sprintf("%s_%d.txt", safeTitle, time.Now().Unix())
+		destPath = filepath.Join(storageFolder, fileName)
+	}
+
+	// .txt faylını fiziki olaraq Storage qovluğuna yazırıq
+	err := os.WriteFile(destPath, []byte(req.Content), 0644)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	absPath, _ := filepath.Abs(destPath)
+	
+	hash := md5.Sum([]byte(absPath))
+	uniqueID := hex.EncodeToString(hash[:])
+
+	newFile := FileData{
+		ID:        uniqueID,
+		Name:      fileName,
+		Path:      absPath,
+		VFolder:   req.VFolder,
+		Tags:      req.Tags,
+		CreatedAt: time.Now(),
+	}
+
+	state.mu.Lock()
+	state.Files = append(state.Files, newFile)
+	state.mu.Unlock()
+	go saveDB()
+
+	w.WriteHeader(http.StatusOK)
+}
+
 func scanHandler(w http.ResponseWriter, r *http.Request) {
 	dir := r.URL.Query().Get("path")
-	if dir != "" {
-		go performScan([]string{dir})
+	if dir != "" { 
+		go performScan([]string{dir}) 
 	}
 	fmt.Fprint(w, "Scan initiated")
 }
@@ -343,13 +388,13 @@ func openFileHandler(w http.ResponseWriter, r *http.Request) {
 
 	if targetPath != "" {
 		switch runtime.GOOS {
-		case "windows":
+		case "windows": 
 			exec.Command("rundll32", "url.dll,FileProtocolHandler", targetPath).Start()
 			fmt.Fprint(w, "Opened on Windows")
-		case "darwin":
+		case "darwin":  
 			exec.Command("open", targetPath).Start()
 			fmt.Fprint(w, "Opened on Mac")
-		default:
+		default:        
 			http.ServeFile(w, r, targetPath)
 		}
 	} else {
@@ -364,10 +409,11 @@ func main() {
 	loadDB()
 	go autoStartupScan()
 
-	http.HandleFunc("/api/search", searchHandler)
-	http.HandleFunc("/api/meta", metaHandler)
+	http.HandleFunc("/api/search", searchHandler) 
+	http.HandleFunc("/api/meta", metaHandler)     
 	http.HandleFunc("/api/update", updateHandler)
 	http.HandleFunc("/api/upload", uploadHandler)
+	http.HandleFunc("/api/create-note", createNoteHandler) // YENİ: Note API-si
 	http.HandleFunc("/api/scan", scanHandler)
 	http.HandleFunc("/api/open", openFileHandler)
 
@@ -444,6 +490,7 @@ const uiHTML = `
                 <div class="flex justify-center gap-3">
                     <button @click="openModal('folders')" class="px-5 py-2 rounded-xl bg-slate-50 text-slate-600 text-xs font-bold hover:bg-slate-100 transition uppercase tracking-widest border border-slate-100">Virtual Qovluqlar</button>
                     <button @click="openModal('recents')" class="px-5 py-2 rounded-xl bg-slate-50 text-slate-600 text-xs font-bold hover:bg-slate-100 transition uppercase tracking-widest border border-slate-100">Son Əlavələr</button>
+                    <button @click="openModal('note')" class="px-5 py-2 rounded-xl bg-green-50 text-green-600 text-xs font-bold hover:bg-green-100 transition uppercase tracking-widest border border-green-100 flex items-center gap-2"><i data-lucide="plus-circle" class="w-4 h-4"></i> Yeni Qeyd</button>
                 </div>
             </div>
         </div>
@@ -476,7 +523,46 @@ const uiHTML = `
             </div>
         </div>
 
-        <div v-if="activeModal && !editingFile && !uploadingFile" class="fixed inset-0 modal-overlay flex items-center justify-center p-6">
+        <div v-if="activeModal === 'note'" class="fixed inset-0 modal-overlay flex items-center justify-center p-6 z-[1000]">
+            <div class="w-full max-w-xl bg-white rounded-[40px] shadow-2xl border border-slate-100 p-10 flex flex-col max-h-[90vh]">
+                <div class="flex justify-between items-center mb-6">
+                    <h2 class="text-2xl font-bold flex items-center gap-2 text-green-600"><i data-lucide="edit"></i> Yeni Qeyd</h2>
+                    <button @click="activeModal = null" class="p-2 hover:bg-slate-100 rounded-full transition"><i data-lucide="x"></i></button>
+                </div>
+
+                <div class="flex-1 overflow-y-auto custom-scroll pr-2">
+                    <div class="mb-4">
+                        <label class="text-[10px] font-bold text-slate-400 uppercase block mb-2">Başlıq</label>
+                        <input v-model="noteTitle" type="text" placeholder="Qeydin adı..." class="w-full p-4 bg-slate-50 rounded-2xl border-none outline-none focus:ring-2 ring-green-100">
+                    </div>
+
+                    <div class="mb-4">
+                        <label class="text-[10px] font-bold text-slate-400 uppercase block mb-2">Məzmun (Mətn)</label>
+                        <textarea v-model="noteContent" rows="6" placeholder="Qeydinizi buraya yazın..." class="w-full p-4 bg-slate-50 rounded-2xl border-none outline-none focus:ring-2 ring-green-100 resize-none"></textarea>
+                    </div>
+
+                    <div class="mb-4">
+                        <label class="text-[10px] font-bold text-slate-400 uppercase block mb-2">Teqlər (Enter ilə əlavə et)</label>
+                        <div class="flex flex-wrap gap-2 p-3 bg-slate-50 rounded-2xl border border-slate-100">
+                            <span v-for="t in uploadTags" @click="uploadTags = uploadTags.filter(tag => tag !== t)" class="bg-white text-green-600 px-3 py-1 rounded-full text-xs font-bold border border-green-100 cursor-pointer hover:bg-red-50 hover:text-red-500 hover:border-red-100 transition">#{{ t }}</span>
+                            <input v-model="newTag" @keyup.enter="addUploadTag" placeholder="..." class="bg-transparent outline-none text-xs flex-1">
+                        </div>
+                    </div>
+
+                    <div class="mb-6">
+                        <label class="text-[10px] font-bold text-slate-400 uppercase block mb-2">Virtual Qovluq</label>
+                        <input v-model="uploadVFolder" list="folder-list" class="w-full p-4 bg-slate-50 rounded-2xl border-none outline-none focus:ring-2 ring-green-100">
+                    </div>
+                </div>
+
+                <div class="flex gap-3 mt-4">
+                    <button @click="saveNote" class="flex-1 bg-green-600 text-white py-4 rounded-2xl font-bold hover:bg-green-700 transition">Qeydi Yarat</button>
+                    <button @click="activeModal = null" class="px-8 py-4 bg-slate-100 text-slate-400 rounded-2xl font-bold hover:bg-slate-200 transition">Ləğv Et</button>
+                </div>
+            </div>
+        </div>
+
+        <div v-if="(activeModal === 'folders' || activeModal === 'recents') && !editingFile && !uploadingFile" class="fixed inset-0 modal-overlay flex items-center justify-center p-6">
             <div class="w-full max-w-xl bg-white rounded-[40px] shadow-2xl border border-slate-100 p-10 flex flex-col max-h-[80vh]">
                 <div class="flex justify-between items-center mb-8">
                     <h2 class="text-2xl font-bold capitalize">{{ activeModal === 'folders' ? 'Qovluqlar' : 'Son Əlavələr' }}</h2>
@@ -547,7 +633,10 @@ const uiHTML = `
                     uploadTags: [], 
                     uploadVFolder: '',
                     searchTimeout: null,
-                    isSearching: false
+                    isSearching: false,
+                    // Qeyd yaratmaq üçün yeni dəyişənlər
+                    noteTitle: '',
+                    noteContent: ''
                 }
             },
             methods: {
@@ -640,8 +729,39 @@ const uiHTML = `
                     this.uploadingFile = null;
                     this.fetchMeta();
                 },
+                // YENİ: Qeyd Yaratma Funksiyası
+                async saveNote() {
+                    if (!this.noteTitle.trim() || !this.noteContent.trim()) {
+                        alert("Zəhmət olmasa, başlıq və məzmunu daxil edin.");
+                        return;
+                    }
+                    const payload = {
+                        title: this.noteTitle,
+                        content: this.noteContent,
+                        tags: this.uploadTags,
+                        vFolder: this.uploadVFolder
+                    };
+
+                    await fetch('/api/create-note', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    this.activeModal = null;
+                    this.fetchMeta();
+                    if (this.query) this.onSearchInput();
+                },
                 openModal(type) {
                     this.activeModal = type;
+                    // Yeni qeyd və ya fayl yükləmə paneli açıldıqda inputları təmizlə
+                    if (type === 'note' || type === 'upload') {
+                        this.uploadTags = [];
+                        this.uploadVFolder = '';
+                        this.noteTitle = '';
+                        this.noteContent = '';
+                        this.newTag = '';
+                    }
                     this.$nextTick(() => lucide.createIcons());
                 },
                 formatDate(d) { return new Date(d).toLocaleDateString(); }
