@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -35,7 +37,6 @@ type AppState struct {
 	mu    sync.RWMutex
 }
 
-// Frontend-ə yalnız lazım olan dataları göndərmək üçün
 type MetaResponse struct {
 	Recents        []FileData `json:"recents"`
 	VirtualFolders []string   `json:"folders"`
@@ -44,6 +45,7 @@ type MetaResponse struct {
 
 const dbPath = "data.json"
 const storageFolder = "ArxivGo_Storage"
+
 var state AppState
 
 // --- BACKEND MƏNTİQİ ---
@@ -69,51 +71,53 @@ func loadDB() {
 
 func saveDB() {
 	state.mu.RLock()
-	// JSON yazılarkən server donmasın deyə məlumatı kopyalayırıq
 	dataCopy := make([]FileData, len(state.Files))
 	copy(dataCopy, state.Files)
 	state.mu.RUnlock()
 
-	// MarshalIndent əvəzinə Marshal (Fayl ölçüsünü xeyli kiçildir və daha sürətlidir)
 	data, _ := json.Marshal(dataCopy)
 	os.WriteFile(dbPath, data, 0644)
 }
 
-// --- SÜRƏTLİ SKAN (WalkDir ilə) ---
+// --- SÜRƏTLİ SKAN VƏ UNİKAL ID YARADILMASI ---
 
 func performScan(pathsToScan []string) {
 	state.mu.RLock()
-	existingFiles := make(map[string]bool, len(state.Files))
+	existingPaths := make(map[string]bool, len(state.Files))
 	for _, f := range state.Files {
-		existingFiles[f.Path] = true
+		existingPaths[f.Path] = true // Path-ə görə yoxlayırıq
 	}
 	state.mu.RUnlock()
 
 	var newFiles []FileData
 
 	for _, dir := range pathsToScan {
-		// Sürətli skan üçün filepath.WalkDir istifadə olunur (Go 1.16+)
 		filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-			if err != nil { return nil }
-			
+			if err != nil {
+				return nil
+			}
+
 			if d.IsDir() {
 				name := d.Name()
-				// Skan edilməyəcək ağır sistem qovluqları
 				if name == ".git" || name == "node_modules" || name == "Windows" || name == "AppData" || name == "sys" {
 					return filepath.SkipDir
 				}
 				return nil
 			}
 
-			if !existingFiles[path] {
+			if !existingPaths[path] {
+				// YENİ: Faylın yoluna əsaslanan unikal MD5 Hash yaradırıq
+				hash := md5.Sum([]byte(path))
+				uniqueID := hex.EncodeToString(hash[:])
+
 				newFiles = append(newFiles, FileData{
-					ID:        fmt.Sprintf("%d", time.Now().UnixNano()),
+					ID:        uniqueID,
 					Name:      d.Name(),
 					Path:      path,
 					Tags:      []string{},
 					CreatedAt: time.Now(),
 				})
-				existingFiles[path] = true
+				existingPaths[path] = true
 			}
 			return nil
 		})
@@ -123,8 +127,7 @@ func performScan(pathsToScan []string) {
 		state.mu.Lock()
 		state.Files = append(state.Files, newFiles...)
 		state.mu.Unlock()
-		
-		// DB yazma əməliyyatını arxa fonda (goroutine) edirik ki, proqram dayanmasın
+
 		go saveDB()
 		fmt.Printf("✅ Skan bitdi: %d yeni fayl tapıldı!\n", len(newFiles))
 	}
@@ -152,26 +155,23 @@ func autoStartupScan() {
 	performScan(pathsToScan)
 }
 
-// --- YENİ OPTİMALLAŞDIRILMIŞ API HANDLERS ---
+// --- API HANDLERS ---
 
-// AXTARIŞ (Browseri yormamaq üçün axtarış serverdə edilir)
 func searchHandler(w http.ResponseWriter, r *http.Request) {
 	query := strings.ToLower(r.URL.Query().Get("q"))
 	folderFilter := r.URL.Query().Get("folder")
-	limit := 100 // Ekrana eyni anda ən çox 100 fayl qaytar
-	
+	limit := 100
+
 	var results []FileData
-	
+
 	state.mu.RLock()
 	defer state.mu.RUnlock()
 
 	for _, f := range state.Files {
-		// Qovluq filtri varsa yoxla
 		if folderFilter != "" && f.VFolder != folderFilter {
 			continue
 		}
 
-		// Axtarış sözü boşdursa, heç nə qaytarma (və ya hamısını qaytara bilərsiniz, amma 300K üçün təhlükəlidir)
 		if query != "" {
 			match := strings.Contains(strings.ToLower(f.Name), query)
 			if !match {
@@ -197,7 +197,6 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(results)
 }
 
-// META DATA (Son oxunanlar və Virtual Qovluqları almaq üçün)
 func metaHandler(w http.ResponseWriter, r *http.Request) {
 	state.mu.RLock()
 	defer state.mu.RUnlock()
@@ -205,9 +204,6 @@ func metaHandler(w http.ResponseWriter, r *http.Request) {
 	foldersMap := make(map[string]bool)
 	var recents []FileData
 
-	// Son əlavə olunan 10 faylı tapmaq üçün müvəqqəti siyahı yaradırıq
-	// 300K faylı tam sort etmək ağır olar deyə, sadəcə ən son 100-ə baxmaq da olar
-	// Lakin Go-da slice-ın sonundakılar adətən ən yenilərdir. Biz son 100-ü sort edirik.
 	var recentCandidates []FileData
 	if len(state.Files) > 100 {
 		recentCandidates = make([]FileData, 100)
@@ -263,16 +259,22 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	state.mu.Unlock()
-	go saveDB() // Arxa fonda yaz ki, UI gözləməsin
+	go saveDB()
 	w.WriteHeader(http.StatusOK)
 }
 
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	err := r.ParseMultipartForm(500 << 20)
-	if err != nil { http.Error(w, err.Error(), 400); return }
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
 
 	file, handler, err := r.FormFile("file")
-	if err != nil { http.Error(w, err.Error(), 400); return }
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
 	defer file.Close()
 
 	tagsJSON := r.FormValue("tags")
@@ -280,7 +282,10 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	destPath := filepath.Join(storageFolder, handler.Filename)
 	destFile, err := os.Create(destPath)
-	if err != nil { http.Error(w, err.Error(), 500); return }
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
 	defer destFile.Close()
 
 	io.Copy(destFile, file)
@@ -292,8 +297,12 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	absPath, _ := filepath.Abs(destPath)
 
+	// YENİ: Upload olan fayla da unikal ID veririk
+	hash := md5.Sum([]byte(absPath))
+	uniqueID := hex.EncodeToString(hash[:])
+
 	newFile := FileData{
-		ID:        fmt.Sprintf("%d", time.Now().UnixNano()),
+		ID:        uniqueID,
 		Name:      handler.Filename,
 		Path:      absPath,
 		VFolder:   vFolder,
@@ -311,8 +320,8 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 
 func scanHandler(w http.ResponseWriter, r *http.Request) {
 	dir := r.URL.Query().Get("path")
-	if dir != "" { 
-		go performScan([]string{dir}) // Skanda brauzeri dondurmamaq üçün arxa fonda
+	if dir != "" {
+		go performScan([]string{dir})
 	}
 	fmt.Fprint(w, "Scan initiated")
 }
@@ -334,13 +343,13 @@ func openFileHandler(w http.ResponseWriter, r *http.Request) {
 
 	if targetPath != "" {
 		switch runtime.GOOS {
-		case "windows": 
+		case "windows":
 			exec.Command("rundll32", "url.dll,FileProtocolHandler", targetPath).Start()
 			fmt.Fprint(w, "Opened on Windows")
-		case "darwin":  
+		case "darwin":
 			exec.Command("open", targetPath).Start()
 			fmt.Fprint(w, "Opened on Mac")
-		default:        
+		default:
 			http.ServeFile(w, r, targetPath)
 		}
 	} else {
@@ -355,8 +364,8 @@ func main() {
 	loadDB()
 	go autoStartupScan()
 
-	http.HandleFunc("/api/search", searchHandler) // YENİ: Server tərəfli axtarış
-	http.HandleFunc("/api/meta", metaHandler)     // YENİ: Metadata (Qovluqlar və Son əlavələr)
+	http.HandleFunc("/api/search", searchHandler)
+	http.HandleFunc("/api/meta", metaHandler)
 	http.HandleFunc("/api/update", updateHandler)
 	http.HandleFunc("/api/upload", uploadHandler)
 	http.HandleFunc("/api/scan", scanHandler)
@@ -526,7 +535,7 @@ const uiHTML = `
             data() {
                 return {
                     query: '', 
-                    searchResults: [], // YENİ: Yalnız Go-dan gələn limitli nəticələr burada saxlanılır
+                    searchResults: [],
                     recents: [], 
                     virtualFolders: [],
                     totalFiles: 0,
@@ -537,12 +546,11 @@ const uiHTML = `
                     uploadingFile: null, 
                     uploadTags: [], 
                     uploadVFolder: '',
-                    searchTimeout: null, // YENİ: Debounce taymeri
+                    searchTimeout: null,
                     isSearching: false
                 }
             },
             methods: {
-                // UI AÇILANDA YALNIZ META DATALARI (Recents, Folders) ÇƏKİLİR
                 async fetchMeta() {
                     const res = await fetch('/api/meta');
                     const data = await res.json();
@@ -552,7 +560,6 @@ const uiHTML = `
                         this.totalFiles = data.totalFiles || 0;
                     }
                 },
-                // AXTARIŞA YAZAN KİMİ İŞƏ DÜŞƏN DEBOUNCE FUNKSİYASI
                 onSearchInput() {
                     clearTimeout(this.searchTimeout);
                     if (this.query.length === 0) {
@@ -561,7 +568,6 @@ const uiHTML = `
                         return;
                     }
                     this.isSearching = true;
-                    // İstifadəçi hərfi yazıb bitirdikdən 300ms sonra Go-ya sorğu gedir
                     this.searchTimeout = setTimeout(async () => {
                         const res = await fetch('/api/search?q=' + encodeURIComponent(this.query));
                         this.searchResults = await res.json() || [];
@@ -578,7 +584,7 @@ const uiHTML = `
                 },
                 async openFile(id) {
                     window.open('/api/open?id=' + id, '_blank');
-                    // Linux/Codespace-də yeni tab açır, Windows .exe isə proqramı açır.
+                    setTimeout(() => this.fetchMeta(), 1000);
                 },
                 startEdit(file) {
                     this.editingFile = JSON.parse(JSON.stringify(file));
@@ -595,7 +601,7 @@ const uiHTML = `
                     await fetch('/api/update', { method: 'POST', body: JSON.stringify(this.editingFile) });
                     this.editingFile = null;
                     this.fetchMeta();
-                    this.onSearchInput(); // Axtarış nəticəsini yenilə
+                    this.onSearchInput(); 
                 },
                 
                 onDragEnter(e) { e.preventDefault(); this.dragActive = true; },
@@ -643,6 +649,7 @@ const uiHTML = `
             mounted() {
                 this.fetchMeta();
                 lucide.createIcons();
+                setInterval(this.fetchMeta, 5000);
 
                 window.addEventListener('dragenter', this.onDragEnter);
                 window.addEventListener('dragover', this.onDragOver);
