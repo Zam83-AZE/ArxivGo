@@ -67,7 +67,58 @@ type APIResponse struct {
 
 const dbPath = "data.json"
 const storageFolder = "ArxivGo_Storage"
+
 var state AppState
+
+// --- SSE (CANLI BİLDİRİŞ) SİSTEMİ ---
+var sseClients = make(map[chan string]bool)
+var sseMu sync.Mutex
+
+func broadcastEvent(message string) {
+	sseMu.Lock()
+	defer sseMu.Unlock()
+	for clientChan := range sseClients {
+		// Non-blocking send
+		select {
+		case clientChan <- message:
+		default:
+		}
+	}
+}
+
+func eventsHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	clientChan := make(chan string)
+	sseMu.Lock()
+	sseClients[clientChan] = true
+	sseMu.Unlock()
+
+	defer func() {
+		sseMu.Lock()
+		delete(sseClients, clientChan)
+		sseMu.Unlock()
+		close(clientChan)
+	}()
+
+	for {
+		select {
+		case msg := <-clientChan:
+			fmt.Fprintf(w, "data: %s\n\n", msg)
+			flusher.Flush()
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
 
 // --- KÖMƏKÇİ FUNKSİYALAR ---
 
@@ -141,7 +192,9 @@ func performScan(pathsToScan []string) {
 
 	for _, dir := range pathsToScan {
 		filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-			if err != nil { return nil }
+			if err != nil {
+				return nil
+			}
 			if d.IsDir() {
 				name := d.Name()
 				if name == ".git" || name == "node_modules" || name == "Windows" || name == "AppData" || name == "sys" {
@@ -202,16 +255,18 @@ func autoStartupScan() {
 func searchHandler(w http.ResponseWriter, r *http.Request) {
 	query := strings.ToLower(r.URL.Query().Get("q"))
 	folderFilter := r.URL.Query().Get("folder")
-	
+
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	if limit <= 0 { limit = 50 } 
-	
+	if limit <= 0 {
+		limit = 50
+	}
+
 	var tagMatches []FileData
 	var nameMatches []FileData
-	
+
 	targetCount := offset + limit
-	
+
 	state.mu.RLock()
 	defer state.mu.RUnlock()
 
@@ -223,7 +278,9 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 			if len(nameMatches) < targetCount {
 				nameMatches = append(nameMatches, f)
 			}
-			if len(nameMatches) >= targetCount { break }
+			if len(nameMatches) >= targetCount {
+				break
+			}
 			continue
 		}
 
@@ -330,18 +387,18 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 	for i, f := range state.Files {
 		if f.ID == updated.ID {
 			state.Files[i].Tags = updated.Tags
-			
+
 			if f.VFolder != updated.VFolder {
 				oldPath := f.Path
-				
+
 				newDir := storageFolder
 				if updated.VFolder != "" {
 					newDir = filepath.Join(storageFolder, filepath.FromSlash(updated.VFolder))
 				}
-				os.MkdirAll(newDir, 0755) 
-				
+				os.MkdirAll(newDir, 0755)
+
 				newPath := filepath.Join(newDir, filepath.Base(oldPath))
-				
+
 				if oldPath != newPath {
 					err := os.Rename(oldPath, newPath)
 					if err != nil {
@@ -360,24 +417,37 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
-			
+
 			state.Files[i].VFolder = updated.VFolder
 			finalName = state.Files[i].Name
 			break
 		}
 	}
 	state.mu.Unlock()
-	go saveDB() 
+	go saveDB()
+
+	// SSE Məlumat Yayımı
+	if isMoved {
+		go broadcastEvent("Fayl başqa qovluğa köçürüldü: " + finalName)
+	} else {
+		go broadcastEvent("Fayl məlumatları yeniləndi: " + finalName)
+	}
 
 	sendJSON(w, APIResponse{Success: true, Moved: isMoved, FileName: finalName})
 }
 
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	err := r.ParseMultipartForm(500 << 20)
-	if err != nil { http.Error(w, err.Error(), 400); return }
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
 
 	file, handler, err := r.FormFile("file")
-	if err != nil { http.Error(w, err.Error(), 400); return }
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
 	defer file.Close()
 
 	tagsJSON := r.FormValue("tags")
@@ -402,7 +472,10 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	destFile, err := os.Create(destPath)
-	if err != nil { http.Error(w, err.Error(), 500); return }
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
 	defer destFile.Close()
 
 	io.Copy(destFile, file)
@@ -442,6 +515,13 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	state.mu.Unlock()
 	go saveDB()
 
+	// SSE Məlumat Yayımı
+	if isVersioned {
+		go broadcastEvent("Bu fayl mövcud idi, YENİ VERSİYASI əlavə edildi: " + finalName)
+	} else {
+		go broadcastEvent("Yeni fayl sistemə əlavə edildi: " + finalName)
+	}
+
 	sendJSON(w, APIResponse{Success: true, Versioned: isVersioned, FileName: finalName})
 }
 
@@ -455,15 +535,17 @@ func createNoteHandler(w http.ResponseWriter, r *http.Request) {
 	safeTitle := strings.ReplaceAll(req.Title, " ", "_")
 	safeTitle = strings.ReplaceAll(safeTitle, "/", "-")
 	safeTitle = strings.ReplaceAll(safeTitle, "\\", "-")
-	if safeTitle == "" { safeTitle = "Adsiz_Qeyd" }
-	
+	if safeTitle == "" {
+		safeTitle = "Adsiz_Qeyd"
+	}
+
 	fileName := safeTitle + ".txt"
 	destDir := storageFolder
 	if req.VFolder != "" {
 		destDir = filepath.Join(storageFolder, filepath.FromSlash(req.VFolder))
 		os.MkdirAll(destDir, 0755)
 	}
-	
+
 	destPath := filepath.Join(destDir, fileName)
 
 	isVersioned := false
@@ -496,13 +578,20 @@ func createNoteHandler(w http.ResponseWriter, r *http.Request) {
 	state.mu.Unlock()
 	go saveDB()
 
+	// SSE Məlumat Yayımı
+	if isVersioned {
+		go broadcastEvent("Bu adda qeyd var idi, YENİ VERSİYASI yaradıldı: " + fileName)
+	} else {
+		go broadcastEvent("Yeni qeyd yaradıldı: " + fileName)
+	}
+
 	sendJSON(w, APIResponse{Success: true, Versioned: isVersioned, FileName: fileName})
 }
 
 func scanHandler(w http.ResponseWriter, r *http.Request) {
 	dir := r.URL.Query().Get("path")
-	if dir != "" { 
-		go performScan([]string{dir}) 
+	if dir != "" {
+		go performScan([]string{dir})
 	}
 	fmt.Fprint(w, "Scan initiated")
 }
@@ -524,13 +613,13 @@ func openFileHandler(w http.ResponseWriter, r *http.Request) {
 
 	if targetPath != "" {
 		switch runtime.GOOS {
-		case "windows": 
+		case "windows":
 			exec.Command("cmd", "/C", "start", "", targetPath).Start()
 			fmt.Fprint(w, "Opened on Windows")
-		case "darwin":  
+		case "darwin":
 			exec.Command("open", targetPath).Start()
 			fmt.Fprint(w, "Opened on Mac")
-		default:        
+		default:
 			exec.Command("xdg-open", targetPath).Start()
 			fmt.Fprint(w, "Opened on Linux")
 		}
@@ -660,11 +749,19 @@ func updateFileContentHandler(w http.ResponseWriter, r *http.Request) {
 		state.Files = append(state.Files, newFile)
 	} else {
 		state.Files[fileIndex].LastAccessed = time.Now()
-		state.Files[fileIndex].CreatedAt = time.Now() 
+		state.Files[fileIndex].CreatedAt = time.Now()
 	}
 	state.mu.Unlock()
 
-	go saveDB() 
+	go saveDB()
+
+	// SSE Məlumat Yayımı
+	if isVersioned {
+		go broadcastEvent("Fayl redaktə edildi və YENİ VERSİYA yaradıldı: " + finalName)
+	} else {
+		go broadcastEvent("Mətn faylı uğurla redaktə edildi: " + finalName)
+	}
+
 	sendJSON(w, APIResponse{Success: true, Versioned: isVersioned, FileName: finalName})
 }
 
@@ -673,17 +770,20 @@ func main() {
 	loadDB()
 	go autoStartupScan()
 
-	http.HandleFunc("/api/search", searchHandler) 
-	http.HandleFunc("/api/meta", metaHandler)     
+	http.HandleFunc("/api/search", searchHandler)
+	http.HandleFunc("/api/meta", metaHandler)
 	http.HandleFunc("/api/update", updateHandler)
 	http.HandleFunc("/api/upload", uploadHandler)
 	http.HandleFunc("/api/create-note", createNoteHandler)
 	http.HandleFunc("/api/scan", scanHandler)
 	http.HandleFunc("/api/open", openFileHandler)
-	http.HandleFunc("/api/download", downloadHandler) 
-	
+	http.HandleFunc("/api/download", downloadHandler)
+
 	http.HandleFunc("/api/get-content", getFileContentHandler)
 	http.HandleFunc("/api/update-content", updateFileContentHandler)
+
+	// YENİ: Bütün canlı hadisələri dinləmək üçün endpoint
+	http.HandleFunc("/api/events", eventsHandler)
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
@@ -697,9 +797,9 @@ func main() {
 	for {
 		listener, err = net.Listen("tcp", fmt.Sprintf(":%d", port))
 		if err == nil {
-			break 
+			break
 		}
-		port++ 
+		port++
 	}
 
 	fmt.Printf("🚀 Server %d portunda hazırdır. UI: http://localhost:%d\n", port, port)
@@ -995,23 +1095,18 @@ const uiHTML = `
                     isLoadingMore: false,
                     currentFolderFilter: '',
                     
-                    // YENİ: UI Toast siyahısı
                     toasts: []
                 }
             },
             methods: {
-                // YENİ BİLDİRİŞ SİSTEMİ: İstənilən yerdə və IP-də ekranın üzərində göstərəcək!
                 notifyUser(message) {
-                    // 1. Həmişə ekranda qəşəng UI Toast çıxart
                     const id = Date.now();
                     this.toasts.push({ id, message });
                     
-                    // 4 saniyə sonra avtomatik silinir
                     setTimeout(() => {
                         this.toasts = this.toasts.filter(t => t.id !== id);
                     }, 4000);
 
-                    // 2. Əgər mümkündürsə (Lokalhost və ya icazə verilibsə) əlavə olaraq OS bildirişi də göndər
                     if ("Notification" in window) {
                         if (Notification.permission === "granted") {
                             new Notification("ArxivGo", { body: message });
@@ -1137,18 +1232,11 @@ const uiHTML = `
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify(payload)
                     });
-                    const data = await res.json();
-
-                    if (data.versioned) {
-                        this.notifyUser("YENİ VERSİYA yaradıldı: " + data.fileName);
-                    } else {
-                        this.notifyUser("Fayl redaktə edildi: " + data.fileName);
-                    }
-
+                    
+                    // Bildirişi artıq Server göndərir
                     this.activeModal = null;
                     this.editTextId = null;
                     this.noteContent = '';
-                    this.fetchMeta();
                 },
 
                 startEdit(file) {
@@ -1164,18 +1252,8 @@ const uiHTML = `
                 removeTag(tag) { this.editingFile.tags = this.editingFile.tags.filter(t => t !== tag); },
                 
                 async saveEdit() {
-                    const res = await fetch('/api/update', { method: 'POST', body: JSON.stringify(this.editingFile) });
-                    const data = await res.json();
-                    
-                    if (data.moved) {
-                        this.notifyUser("Fayl başqa qovluğa köçürüldü: " + data.fileName);
-                    } else {
-                        this.notifyUser("Məlumatlar yeniləndi: " + data.fileName);
-                    }
-
+                    await fetch('/api/update', { method: 'POST', body: JSON.stringify(this.editingFile) });
                     this.editingFile = null;
-                    this.fetchMeta();
-                    if (this.query) await this.performSearch(false); 
                 },
                 
                 onDragEnter(e) { e.preventDefault(); this.dragActive = true; },
@@ -1209,17 +1287,8 @@ const uiHTML = `
                     formData.append('tags', JSON.stringify(this.uploadTags));
                     formData.append('vFolder', this.uploadVFolder);
 
-                    const res = await fetch('/api/upload', { method: 'POST', body: formData });
-                    const data = await res.json();
-                    
-                    if (data.versioned) {
-                        this.notifyUser("YENİ VERSİYA əlavə edildi: " + data.fileName);
-                    } else {
-                        this.notifyUser("Fayl sistemə əlavə edildi: " + data.fileName);
-                    }
-
+                    await fetch('/api/upload', { method: 'POST', body: formData });
                     this.uploadingFile = null;
-                    this.fetchMeta();
                 },
                 async saveNote() {
                     if (!this.noteTitle.trim() || !this.noteContent.trim()) {
@@ -1233,22 +1302,12 @@ const uiHTML = `
                         vFolder: this.uploadVFolder
                     };
 
-                    const res = await fetch('/api/create-note', {
+                    await fetch('/api/create-note', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify(payload)
                     });
-                    const data = await res.json();
-
-                    if (data.versioned) {
-                        this.notifyUser("Qeydin YENİ VERSİYASI yaradıldı: " + data.fileName);
-                    } else {
-                        this.notifyUser("Yeni qeyd yaradıldı: " + data.fileName);
-                    }
-
                     this.activeModal = null;
-                    this.fetchMeta();
-                    if (this.query) await this.performSearch(false);
                 },
                 openModal(type) {
                     this.activeModal = type;
@@ -1273,14 +1332,21 @@ const uiHTML = `
             mounted() {
                 this.fetchMeta();
                 lucide.createIcons();
-                setInterval(this.fetchMeta, 5000);
+
+                // YENİ: Server-Sent Events qoşulması
+                // Serverdən canli gələn hər bildirişi dinləyirik və məlumatı avtomatik yeniləyirik
+                const evtSource = new EventSource('/api/events');
+                evtSource.onmessage = (event) => {
+                    this.notifyUser(event.data);
+                    this.fetchMeta();
+                    if (this.query) this.performSearch(false);
+                };
 
                 window.addEventListener('dragenter', this.onDragEnter);
                 window.addEventListener('dragover', this.onDragOver);
                 window.addEventListener('dragleave', this.onDragLeave);
                 window.addEventListener('drop', this.onDrop);
 
-                // Təhlükəsizlik icazəsi üçün klik hadisəsi
                 const requestPerm = () => {
                     if ("Notification" in window && Notification.permission === "default" && window.isSecureContext) {
                         Notification.requestPermission();
