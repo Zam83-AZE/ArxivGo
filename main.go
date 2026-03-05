@@ -174,7 +174,7 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 		limit = 50
 	}
 
-	// YENİ: İki fərqli siyahı (səbət) yaradırıq.
+	// İki fərqli siyahı (səbət) yaradırıq.
 	var tagMatches []FileData
 	var nameMatches []FileData
 
@@ -188,7 +188,6 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// Boş axtarışdırsa (Məsələn yalnız qovluğa görə), hər şeyi nameMatches-ə yığ
 		if query == "" {
 			if len(nameMatches) < targetCount {
 				nameMatches = append(nameMatches, f)
@@ -207,7 +206,6 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// YENİ MƏNTİQ: Teqə uyğundursa birinci səbətə, adına uyğundursa ikinci səbətə atırıq
 		if isTagMatch {
 			if len(tagMatches) < targetCount {
 				tagMatches = append(tagMatches, f)
@@ -220,18 +218,15 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Hər iki səbət lazım olan sayda dolubsa, axtarışı dayandır ki, 300K fayl sistemi yormasın
 		if len(tagMatches) >= targetCount && len(nameMatches) >= targetCount {
 			break
 		}
 	}
 
-	// YENİ: İki səbəti ardıcıl birləşdiririk (Öncə TEQ tapıntıları, sonra AD tapıntıları)
 	var allMatches []FileData
 	allMatches = append(allMatches, tagMatches...)
 	allMatches = append(allMatches, nameMatches...)
 
-	// Scroll (Offset/Limit) üçün siyahının yalnız bizə lazım olan kəsimini götürürük
 	results := []FileData{}
 	if offset < len(allMatches) {
 		end := offset + limit
@@ -440,13 +435,15 @@ func openFileHandler(w http.ResponseWriter, r *http.Request) {
 	if targetPath != "" {
 		switch runtime.GOOS {
 		case "windows":
-			exec.Command("rundll32", "url.dll,FileProtocolHandler", targetPath).Start()
+			// MÜHÜM YENİLİK: Bütün Unicode (Azərbaycan/Rus) hərflərini dəstəkləyən qüsursuz açılış əmri!
+			exec.Command("cmd", "/C", "start", "", targetPath).Start()
 			fmt.Fprint(w, "Opened on Windows")
 		case "darwin":
 			exec.Command("open", targetPath).Start()
 			fmt.Fprint(w, "Opened on Mac")
 		default:
-			http.ServeFile(w, r, targetPath)
+			exec.Command("xdg-open", targetPath).Start()
+			fmt.Fprint(w, "Opened on Linux")
 		}
 	} else {
 		http.Error(w, "Fayl tapılmadı", http.StatusNotFound)
