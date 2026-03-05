@@ -174,8 +174,11 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 		limit = 50
 	}
 
-	var results []FileData
-	matchCount := 0
+	// YENİ: İki fərqli siyahı (səbət) yaradırıq.
+	var tagMatches []FileData
+	var nameMatches []FileData
+
+	targetCount := offset + limit
 
 	state.mu.RLock()
 	defer state.mu.RUnlock()
@@ -185,29 +188,57 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		if query != "" {
-			match := strings.Contains(strings.ToLower(f.Name), query)
-			if !match {
-				for _, t := range f.Tags {
-					if strings.Contains(strings.ToLower(t), query) {
-						match = true
-						break
-					}
+		// Boş axtarışdırsa (Məsələn yalnız qovluğa görə), hər şeyi nameMatches-ə yığ
+		if query == "" {
+			if len(nameMatches) < targetCount {
+				nameMatches = append(nameMatches, f)
+			}
+			if len(nameMatches) >= targetCount {
+				break
+			}
+			continue
+		}
+
+		isTagMatch := false
+		for _, t := range f.Tags {
+			if strings.Contains(strings.ToLower(t), query) {
+				isTagMatch = true
+				break
+			}
+		}
+
+		// YENİ MƏNTİQ: Teqə uyğundursa birinci səbətə, adına uyğundursa ikinci səbətə atırıq
+		if isTagMatch {
+			if len(tagMatches) < targetCount {
+				tagMatches = append(tagMatches, f)
+			}
+		} else {
+			if strings.Contains(strings.ToLower(f.Name), query) {
+				if len(nameMatches) < targetCount {
+					nameMatches = append(nameMatches, f)
 				}
 			}
-			if !match {
-				continue
-			}
 		}
 
-		if matchCount >= offset {
-			results = append(results, f)
-		}
-		matchCount++
-
-		if len(results) >= limit {
+		// Hər iki səbət lazım olan sayda dolubsa, axtarışı dayandır ki, 300K fayl sistemi yormasın
+		if len(tagMatches) >= targetCount && len(nameMatches) >= targetCount {
 			break
 		}
+	}
+
+	// YENİ: İki səbəti ardıcıl birləşdiririk (Öncə TEQ tapıntıları, sonra AD tapıntıları)
+	var allMatches []FileData
+	allMatches = append(allMatches, tagMatches...)
+	allMatches = append(allMatches, nameMatches...)
+
+	// Scroll (Offset/Limit) üçün siyahının yalnız bizə lazım olan kəsimini götürürük
+	results := []FileData{}
+	if offset < len(allMatches) {
+		end := offset + limit
+		if end > len(allMatches) {
+			end = len(allMatches)
+		}
+		results = allMatches[offset:end]
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -752,7 +783,6 @@ const uiHTML = `
                         }
                     }
                 },
-                // Səssiz Açılış İcra Edilir (Yeni tab açılmır)
                 async openFile(id) {
                     await fetch('/api/open?id=' + id);
                     setTimeout(() => this.fetchMeta(), 1000);
