@@ -53,6 +53,7 @@ type NoteRequest struct {
 
 const dbPath = "data.json"
 const storageFolder = "ArxivGo_Storage"
+
 var state AppState
 
 // --- BACKEND MƏNTİQİ ---
@@ -92,7 +93,7 @@ func performScan(pathsToScan []string) {
 	state.mu.RLock()
 	existingPaths := make(map[string]bool, len(state.Files))
 	for _, f := range state.Files {
-		existingPaths[f.Path] = true 
+		existingPaths[f.Path] = true
 	}
 	state.mu.RUnlock()
 
@@ -100,8 +101,10 @@ func performScan(pathsToScan []string) {
 
 	for _, dir := range pathsToScan {
 		filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-			if err != nil { return nil }
-			
+			if err != nil {
+				return nil
+			}
+
 			if d.IsDir() {
 				name := d.Name()
 				if name == ".git" || name == "node_modules" || name == "Windows" || name == "AppData" || name == "sys" {
@@ -131,7 +134,7 @@ func performScan(pathsToScan []string) {
 		state.mu.Lock()
 		state.Files = append(state.Files, newFiles...)
 		state.mu.Unlock()
-		
+
 		go saveDB()
 		fmt.Printf("✅ Skan bitdi: %d yeni fayl tapıldı!\n", len(newFiles))
 	}
@@ -164,15 +167,16 @@ func autoStartupScan() {
 func searchHandler(w http.ResponseWriter, r *http.Request) {
 	query := strings.ToLower(r.URL.Query().Get("q"))
 	folderFilter := r.URL.Query().Get("folder")
-	
-	// YENİ: Pagination (Sonsuz Scroll) üçün offset və limit qəbul edirik
+
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	if limit <= 0 { limit = 50 } // Default limit 50 olsun
-	
+	if limit <= 0 {
+		limit = 50
+	}
+
 	var results []FileData
 	matchCount := 0
-	
+
 	state.mu.RLock()
 	defer state.mu.RUnlock()
 
@@ -191,16 +195,19 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
-			if !match { continue }
+			if !match {
+				continue
+			}
 		}
 
-		// YENİ: Limit və Offset Məntiqi (Sürətli Süzmə)
 		if matchCount >= offset {
 			results = append(results, f)
 		}
 		matchCount++
-		
-		if len(results) >= limit { break }
+
+		if len(results) >= limit {
+			break
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -269,16 +276,22 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	state.mu.Unlock()
-	go saveDB() 
+	go saveDB()
 	w.WriteHeader(http.StatusOK)
 }
 
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	err := r.ParseMultipartForm(500 << 20)
-	if err != nil { http.Error(w, err.Error(), 400); return }
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
 
 	file, handler, err := r.FormFile("file")
-	if err != nil { http.Error(w, err.Error(), 400); return }
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
 	defer file.Close()
 
 	tagsJSON := r.FormValue("tags")
@@ -286,7 +299,10 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	destPath := filepath.Join(storageFolder, handler.Filename)
 	destFile, err := os.Create(destPath)
-	if err != nil { http.Error(w, err.Error(), 500); return }
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
 	defer destFile.Close()
 
 	io.Copy(destFile, file)
@@ -297,7 +313,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	absPath, _ := filepath.Abs(destPath)
-	
+
 	hash := md5.Sum([]byte(absPath))
 	uniqueID := hex.EncodeToString(hash[:])
 
@@ -328,8 +344,10 @@ func createNoteHandler(w http.ResponseWriter, r *http.Request) {
 	safeTitle := strings.ReplaceAll(req.Title, " ", "_")
 	safeTitle = strings.ReplaceAll(safeTitle, "/", "-")
 	safeTitle = strings.ReplaceAll(safeTitle, "\\", "-")
-	if safeTitle == "" { safeTitle = "Adsiz_Qeyd" }
-	
+	if safeTitle == "" {
+		safeTitle = "Adsiz_Qeyd"
+	}
+
 	fileName := safeTitle + ".txt"
 	destPath := filepath.Join(storageFolder, fileName)
 
@@ -367,8 +385,8 @@ func createNoteHandler(w http.ResponseWriter, r *http.Request) {
 
 func scanHandler(w http.ResponseWriter, r *http.Request) {
 	dir := r.URL.Query().Get("path")
-	if dir != "" { 
-		go performScan([]string{dir}) 
+	if dir != "" {
+		go performScan([]string{dir})
 	}
 	fmt.Fprint(w, "Scan initiated")
 }
@@ -390,14 +408,13 @@ func openFileHandler(w http.ResponseWriter, r *http.Request) {
 
 	if targetPath != "" {
 		switch runtime.GOOS {
-		case "windows": 
-			// YENİ: Səssiz açılış (Brauzerdə heç bir reaksiya olmadan OS-də açılır)
+		case "windows":
 			exec.Command("rundll32", "url.dll,FileProtocolHandler", targetPath).Start()
 			fmt.Fprint(w, "Opened on Windows")
-		case "darwin":  
+		case "darwin":
 			exec.Command("open", targetPath).Start()
 			fmt.Fprint(w, "Opened on Mac")
-		default:        
+		default:
 			http.ServeFile(w, r, targetPath)
 		}
 	} else {
@@ -412,8 +429,8 @@ func main() {
 	loadDB()
 	go autoStartupScan()
 
-	http.HandleFunc("/api/search", searchHandler) 
-	http.HandleFunc("/api/meta", metaHandler)     
+	http.HandleFunc("/api/search", searchHandler)
+	http.HandleFunc("/api/meta", metaHandler)
 	http.HandleFunc("/api/update", updateHandler)
 	http.HandleFunc("/api/upload", uploadHandler)
 	http.HandleFunc("/api/create-note", createNoteHandler)
@@ -452,7 +469,7 @@ const uiHTML = `
 </head>
 <body class="w-screen h-screen">
     
-    <div id="app" class="w-full h-full flex items-center justify-center relative bg-white">
+    <div id="app" class="w-full h-full flex flex-col items-center justify-center relative bg-white">
         
         <div :class="dragActive ? 'drop-zone-active' : 'drop-zone-inactive'" 
              class="fixed inset-0 bg-blue-50/90 border-[6px] border-dashed border-blue-400 flex items-center justify-center transition-opacity duration-200">
@@ -461,41 +478,50 @@ const uiHTML = `
             </div>
         </div>
 
-        <div class="w-full max-w-2xl px-6 relative z-10">
-            <div v-if="!activeModal && !editingFile && !uploadingFile" class="text-center relative">
+        <div class="w-full max-w-2xl px-6 relative z-10 flex flex-col">
+            <div v-if="!activeModal && !editingFile && !uploadingFile" class="text-center w-full">
                 <h1 class="text-5xl font-light mb-1 select-none">Arxiv<span class="font-bold text-blue-600">Go</span></h1>
                 <p class="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-10">Cəmi Fayl: {{ totalFiles }}</p>
 
-                <div class="search-container flex items-center bg-white border border-slate-200 rounded-full px-6 py-4 mb-8 transition-all shadow-sm">
-                    <i data-lucide="search" class="w-5 h-5 text-slate-400 mr-4"></i>
-                    <input v-model="query" @input="onSearchInput" type="text" placeholder="Axtar və ya faylı ekrana at..." class="flex-1 outline-none text-lg bg-transparent">
-                    <div v-if="isSearching" class="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
-                </div>
+                <div class="relative w-full mb-8">
+                    <div class="search-container flex items-center bg-white border border-slate-200 rounded-full px-6 py-4 transition-all shadow-sm relative z-20">
+                        <i data-lucide="search" class="w-5 h-5 text-slate-400 mr-4"></i>
+                        <input v-model="query" @input="onSearchInput" type="text" placeholder="Axtar və ya faylı ekrana at..." class="flex-1 outline-none text-lg bg-transparent">
+                        <div v-if="isSearching" class="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+                    </div>
 
-                <div v-if="searchResults.length > 0" 
-                     @scroll="handleScroll"
-                     class="absolute w-full left-0 max-w-2xl mx-auto mt-2 bg-white border border-slate-100 rounded-3xl shadow-2xl z-50 overflow-hidden text-left max-h-[50vh] custom-scroll overflow-y-auto flex flex-col pb-4">
-                    <div v-for="f in searchResults" :key="f.id" class="px-6 py-4 hover:bg-blue-50/50 flex justify-between items-center group cursor-pointer border-b border-slate-50 last:border-0 shrink-0">
-                        <div @click="openFile(f.id)" class="flex-1 flex items-center gap-4">
-                            <i data-lucide="file" class="w-5 h-5 text-slate-300"></i>
-                            <div>
-                                <div class="text-sm font-medium">{{ f.name }}</div>
-                                <div class="flex gap-2 mt-1">
-                                    <span v-for="t in f.tags" class="text-[9px] bg-blue-50 text-blue-500 px-2 py-0.5 rounded font-bold uppercase tracking-tighter">#{{ t }}</span>
-                                    <span v-if="f.vFolder" class="text-[9px] bg-slate-100 text-slate-500 px-2 py-0.5 rounded font-bold uppercase tracking-tighter">{{ f.vFolder }}</span>
+                    <div v-if="searchResults.length > 0" 
+                         @scroll="handleScroll"
+                         class="absolute w-full left-0 mt-2 bg-white border border-slate-100 rounded-3xl shadow-2xl z-50 overflow-hidden text-left flex flex-col custom-scroll"
+                         style="max-height: 45vh; overflow-y: auto;">
+                        
+                        <div v-for="f in searchResults" :key="f.id" class="px-6 py-4 hover:bg-blue-50/50 flex justify-between items-center group cursor-pointer border-b border-slate-50 last:border-0 shrink-0">
+                            <div @click="openFile(f.id)" class="flex-1 flex items-center gap-4">
+                                <i data-lucide="file" class="w-5 h-5 text-slate-300"></i>
+                                <div>
+                                    <div class="text-sm font-medium">{{ f.name }}</div>
+                                    <div class="flex gap-2 mt-1">
+                                        <span v-for="t in f.tags" class="text-[9px] bg-blue-50 text-blue-500 px-2 py-0.5 rounded font-bold uppercase tracking-tighter">#{{ t }}</span>
+                                        <span v-if="f.vFolder" class="text-[9px] bg-slate-100 text-slate-500 px-2 py-0.5 rounded font-bold uppercase tracking-tighter">{{ f.vFolder }}</span>
+                                    </div>
                                 </div>
                             </div>
+                            <button @click.stop="startEdit(f)" class="p-2 opacity-0 group-hover:opacity-100 hover:bg-white shadow-sm rounded-full transition text-blue-600">
+                                <i data-lucide="edit-3" class="w-4 h-4"></i>
+                            </button>
                         </div>
-                        <button @click.stop="startEdit(f)" class="p-2 opacity-0 group-hover:opacity-100 hover:bg-white shadow-sm rounded-full transition text-blue-600">
-                            <i data-lucide="edit-3" class="w-4 h-4"></i>
-                        </button>
-                    </div>
-                    <div v-if="isLoadingMore" class="py-4 text-center text-xs font-bold text-slate-400 flex justify-center items-center gap-2">
-                        <div class="w-3 h-3 border-2 border-slate-400 border-t-transparent rounded-full animate-spin"></div> Yüklənir...
+
+                        <div v-if="isLoadingMore" class="py-4 text-center text-xs font-bold text-slate-400 flex justify-center items-center gap-2">
+                            <div class="w-3 h-3 border-2 border-slate-400 border-t-transparent rounded-full animate-spin"></div> Yüklənir...
+                        </div>
+                        
+                        <div v-if="!hasMore && searchResults.length > 0" class="py-3 text-center text-[10px] text-slate-300 uppercase tracking-widest font-bold bg-slate-50 border-t border-slate-100">
+                            Siyahının sonu
+                        </div>
                     </div>
                 </div>
 
-                <div class="flex justify-center gap-3" :class="searchResults.length > 0 ? 'mt-4' : ''">
+                <div class="flex justify-center gap-3">
                     <button @click="openModal('folders')" class="px-5 py-2 rounded-xl bg-slate-50 text-slate-600 text-xs font-bold hover:bg-slate-100 transition uppercase tracking-widest border border-slate-100">Virtual Qovluqlar</button>
                     <button @click="openModal('recents')" class="px-5 py-2 rounded-xl bg-slate-50 text-slate-600 text-xs font-bold hover:bg-slate-100 transition uppercase tracking-widest border border-slate-100">Son Əlavələr</button>
                     <button @click="openModal('note')" class="px-5 py-2 rounded-xl bg-green-50 text-green-600 text-xs font-bold hover:bg-green-100 transition uppercase tracking-widest border border-green-100 flex items-center gap-2"><i data-lucide="plus-circle" class="w-4 h-4"></i> Yeni Qeyd</button>
@@ -645,7 +671,6 @@ const uiHTML = `
                     noteTitle: '',
                     noteContent: '',
                     
-                    // YENİ: Sonsuz Scroll üçün dəyişənlər
                     offset: 0,
                     limit: 50,
                     hasMore: true,
@@ -663,7 +688,6 @@ const uiHTML = `
                         this.totalFiles = data.totalFiles || 0;
                     }
                 },
-                // YENİ: Sürətli Axtarış və Sonsuz Scroll Məntiqi
                 async performSearch(isAppend = false) {
                     if (!isAppend) {
                         this.offset = 0;
@@ -677,7 +701,7 @@ const uiHTML = `
                     } else if (this.query) {
                         url += '&q=' + encodeURIComponent(this.query);
                     } else {
-                        return; // Boş axtarış
+                        return;
                     }
 
                     const res = await fetch(url);
@@ -690,13 +714,13 @@ const uiHTML = `
                     }
 
                     if (data.length < this.limit) {
-                        this.hasMore = false; // Əgər gələn data limitdən azdırsa, demək sonuncu səhifədir
+                        this.hasMore = false; 
                     }
                     this.offset += data.length;
                 },
                 onSearchInput() {
                     clearTimeout(this.searchTimeout);
-                    this.currentFolderFilter = ''; // Folder filtrini sıfırla
+                    this.currentFolderFilter = ''; 
                     
                     if (this.query.length === 0) {
                         this.searchResults = [];
@@ -718,10 +742,8 @@ const uiHTML = `
                     await this.performSearch(false);
                     this.isSearching = false;
                 },
-                // YENİ: Scroll olunduqda avtomatik əlavə yükləmə
                 async handleScroll(e) {
                     const { scrollTop, clientHeight, scrollHeight } = e.target;
-                    // Siyahının sonuna 20px qalmış yeni məlumatları çək
                     if (scrollTop + clientHeight >= scrollHeight - 20) {
                         if (this.hasMore && !this.isLoadingMore) {
                             this.isLoadingMore = true;
@@ -730,9 +752,8 @@ const uiHTML = `
                         }
                     }
                 },
-                // YENİ: Səssiz Açılış (Yeni Tab Açmadan)
+                // Səssiz Açılış İcra Edilir (Yeni tab açılmır)
                 async openFile(id) {
-                    // Sadəcə arxa planda Go-ya siqnal veririk. Əməliyyat sistemi faylı açacaq.
                     await fetch('/api/open?id=' + id);
                     setTimeout(() => this.fetchMeta(), 1000);
                 },
@@ -751,7 +772,6 @@ const uiHTML = `
                     await fetch('/api/update', { method: 'POST', body: JSON.stringify(this.editingFile) });
                     this.editingFile = null;
                     this.fetchMeta();
-                    // Əgər ekranda siyahı varsa, səhifəni sıfırlayıb yenidən axtar
                     if (this.query) await this.performSearch(false); 
                 },
                 
