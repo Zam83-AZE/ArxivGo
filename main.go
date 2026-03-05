@@ -64,17 +64,15 @@ var state AppState
 
 // --- KÖMƏKÇİ FUNKSİYALAR ---
 
-// YENİ: Fayl adından növbəti versiyanı tapmaq üçün funksiya (məs: fayl.txt -> fayl_v2.txt)
 func getNextVersion(dir, filename string) (string, string) {
 	ext := filepath.Ext(filename)
 	base := strings.TrimSuffix(filename, ext)
 
 	version := 2
-	// Əgər adda artıq "_vX" varsa, onu tapıb artırırıq
 	if idx := strings.LastIndex(base, "_v"); idx != -1 {
 		if v, err := strconv.Atoi(base[idx+2:]); err == nil {
 			version = v + 1
-			base = base[:idx] // "_v" hissəsini kəsirik
+			base = base[:idx]
 		}
 	}
 
@@ -118,8 +116,6 @@ func saveDB() {
 	data, _ := json.Marshal(dataCopy)
 	os.WriteFile(dbPath, data, 0644)
 }
-
-// --- SÜRƏTLİ SKAN VƏ UNİKAL ID YARADILMASI ---
 
 func performScan(pathsToScan []string) {
 	state.mu.RLock()
@@ -390,12 +386,9 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	finalName := handler.Filename
 	destPath := filepath.Join(destDir, finalName)
 
-	// YENİ: Faylın həcminə görə yoxlanış və Versiyalama
 	info, err := os.Stat(destPath)
 	if err == nil {
-		// Fayl eyni qovluqda mövcuddur, bayt həcmini yoxlayırıq
 		if info.Size() != handler.Size {
-			// Həcm fərqlidir -> Versiyalama işə düşür!
 			finalName, destPath = getNextVersion(destDir, handler.Filename)
 		}
 	}
@@ -418,15 +411,13 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	hash := md5.Sum([]byte(absPath))
 	uniqueID := hex.EncodeToString(hash[:])
 
-	// Baza qeydiyyatı
 	state.mu.Lock()
 	existsInDB := false
 	for i, f := range state.Files {
-		// Əgər eyni faylı üstünə yazmışıqsa (həcm eyni idisə)
 		if f.Path == absPath {
 			state.Files[i].Tags = tags
 			state.Files[i].VFolder = vFolder
-			state.Files[i].CreatedAt = time.Now() // Son Əlavələrə düşsün
+			state.Files[i].CreatedAt = time.Now()
 			existsInDB = true
 			break
 		}
@@ -472,7 +463,6 @@ func createNoteHandler(w http.ResponseWriter, r *http.Request) {
 
 	destPath := filepath.Join(destDir, fileName)
 
-	// YENİ: Eyni adlı qeyd varsa versiyalama işə düşür
 	if _, err := os.Stat(destPath); err == nil {
 		fileName, destPath = getNextVersion(destDir, fileName)
 	}
@@ -512,7 +502,6 @@ func scanHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, "Scan initiated")
 }
 
-// 1. LOKAL AÇILIŞ
 func openFileHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	state.mu.Lock()
@@ -545,7 +534,6 @@ func openFileHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// 2. ŞƏBƏKƏ/KƏNAR AÇILIŞ (Download və View)
 func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	state.mu.Lock()
@@ -576,7 +564,6 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// Veb redaktor üçün faylın məzmununu gətirir
 func getFileContentHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	state.mu.RLock()
@@ -599,7 +586,6 @@ func getFileContentHandler(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "Fayl tapılmadı və ya oxunmadı", http.StatusNotFound)
 }
 
-// YENİ: Veb redaktorda edilən dəyişiklikləri yoxlayır və lazım gəlsə versiyalama edir
 func updateFileContentHandler(w http.ResponseWriter, r *http.Request) {
 	var req UpdateContentRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -636,13 +622,10 @@ func updateFileContentHandler(w http.ResponseWriter, r *http.Request) {
 	isVersioned := false
 	var finalName, finalPath string
 
-	// YENİ: Bayt həcminə görə fərq yoxlanışı
 	if info.Size() != int64(len(newContent)) {
-		// Həcm dəyişib! Versiyalama yaradırıq.
 		finalName, finalPath = getNextVersion(filepath.Dir(existingFile.Path), existingFile.Name)
 		isVersioned = true
 	} else {
-		// Həcm eynidirsə, sadəcə üzərinə yazırıq
 		finalName = existingFile.Name
 		finalPath = existingFile.Path
 	}
@@ -655,7 +638,6 @@ func updateFileContentHandler(w http.ResponseWriter, r *http.Request) {
 
 	state.mu.Lock()
 	if isVersioned {
-		// Yeni versiya faylı üçün bazaya yeni qeyd əlavə edirik
 		absPath, _ := filepath.Abs(finalPath)
 		hash := md5.Sum([]byte(absPath))
 		uniqueID := hex.EncodeToString(hash[:])
@@ -672,17 +654,14 @@ func updateFileContentHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		state.Files = append(state.Files, newFile)
 	} else {
-		// Üzərinə yazılıbsa, sadəcə vaxtı yeniləyirik
 		state.Files[fileIndex].LastAccessed = time.Now()
-		state.Files[fileIndex].CreatedAt = time.Now() // Son Əlavələrdə ən üstdə görünsün
+		state.Files[fileIndex].CreatedAt = time.Now()
 	}
 	state.mu.Unlock()
 
 	go saveDB()
 	w.WriteHeader(http.StatusOK)
 }
-
-// --- MAIN ---
 
 func main() {
 	initStorage()
@@ -760,7 +739,7 @@ const uiHTML = `
                 <p class="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-10">Cəmi Fayl: {{ totalFiles }}</p>
 
                 <div class="flex justify-center gap-3 mb-8">
-                    <button @click="openModal('folders')" class="px-5 py-2 rounded-xl bg-slate-50 text-slate-600 text-xs font-bold hover:bg-slate-100 transition uppercase tracking-widest border border-slate-100">Virtual Qovluqlar</button>
+                    <button @click="openModal('folders')" class="px-5 py-2 rounded-xl bg-slate-50 text-slate-600 text-xs font-bold hover:bg-slate-100 transition uppercase tracking-widest border border-slate-100">Qovluqlar</button>
                     <button @click="openModal('recents')" class="px-5 py-2 rounded-xl bg-slate-50 text-slate-600 text-xs font-bold hover:bg-slate-100 transition uppercase tracking-widest border border-slate-100">Son Əlavələr</button>
                     <button @click="openModal('note')" class="px-5 py-2 rounded-xl bg-green-50 text-green-600 text-xs font-bold hover:bg-green-100 transition uppercase tracking-widest border border-green-100 flex items-center gap-2"><i data-lucide="plus-circle" class="w-4 h-4"></i> Yeni Qeyd</button>
                 </div>
@@ -779,16 +758,16 @@ const uiHTML = `
                         
                         <div v-for="f in searchResults" :key="f.id" class="px-6 py-4 hover:bg-blue-50/50 flex justify-between items-center group cursor-pointer border-b border-slate-50 last:border-0 shrink-0">
                             <div @click="openFile(f)" class="flex-1 flex items-center gap-4">
-                                <i data-lucide="file" class="w-5 h-5 text-slate-300"></i>
+                                <i data-lucide="file" class="w-5 h-5 text-slate-300 flex-shrink-0"></i>
                                 <div>
-                                    <div class="text-sm font-medium">{{ f.name }}</div>
-                                    <div class="flex gap-2 mt-1">
+                                    <div class="text-sm font-medium break-words">{{ f.name }}</div>
+                                    <div class="flex gap-2 mt-1 flex-wrap">
                                         <span v-for="t in f.tags" class="text-[9px] bg-blue-50 text-blue-500 px-2 py-0.5 rounded font-bold uppercase tracking-tighter">#{{ t }}</span>
                                         <span v-if="f.vFolder" class="text-[9px] bg-slate-100 text-slate-500 px-2 py-0.5 rounded font-bold uppercase tracking-tighter">{{ f.vFolder }}</span>
                                     </div>
                                 </div>
                             </div>
-                            <button @click.stop="startEdit(f)" class="p-2 opacity-0 group-hover:opacity-100 hover:bg-white shadow-sm rounded-full transition text-blue-600">
+                            <button @click.stop="startEdit(f)" class="p-2 opacity-0 group-hover:opacity-100 hover:bg-white shadow-sm rounded-full transition text-blue-600 flex-shrink-0">
                                 <i data-lucide="edit-3" class="w-4 h-4"></i>
                             </button>
                         </div>
@@ -808,8 +787,8 @@ const uiHTML = `
         <div v-if="uploadingFile" class="fixed inset-0 modal-overlay flex items-center justify-center p-6 z-[1000]">
             <div class="w-full max-w-md bg-white rounded-[40px] shadow-2xl border border-slate-100 p-10">
                 <div class="flex items-center gap-3 text-blue-600 mb-2">
-                    <i data-lucide="file-plus" class="w-6 h-6"></i>
-                    <h3 class="text-xl font-bold truncate">{{ uploadingFile.name }}</h3>
+                    <i data-lucide="file-plus" class="w-6 h-6 flex-shrink-0"></i>
+                    <h3 class="text-xl font-bold break-words">{{ uploadingFile.name }}</h3>
                 </div>
                 <p class="text-[10px] text-slate-400 uppercase tracking-widest mb-8">Yeni Fayl Əlavə Olunur</p>
 
@@ -822,7 +801,7 @@ const uiHTML = `
                 </div>
 
                 <div class="mb-10">
-                    <label class="text-[10px] font-bold text-slate-400 uppercase block mb-2">Virtual Qovluq</label>
+                    <label class="text-[10px] font-bold text-slate-400 uppercase block mb-2">Qovluq</label>
                     <input v-model="uploadVFolder" list="folder-list" class="w-full p-4 bg-slate-50 rounded-2xl border-none outline-none focus:ring-2 ring-blue-100">
                 </div>
 
@@ -860,7 +839,7 @@ const uiHTML = `
                     </div>
 
                     <div class="mb-6">
-                        <label class="text-[10px] font-bold text-slate-400 uppercase block mb-2">Virtual Qovluq</label>
+                        <label class="text-[10px] font-bold text-slate-400 uppercase block mb-2">Qovluq</label>
                         <input v-model="uploadVFolder" list="folder-list" class="w-full p-4 bg-slate-50 rounded-2xl border-none outline-none focus:ring-2 ring-green-100">
                     </div>
                 </div>
@@ -880,8 +859,8 @@ const uiHTML = `
                 </div>
 
                 <div class="mb-4">
-                    <label class="text-[10px] font-bold text-slate-400 uppercase block mb-2">Faylın Adı (Yalnız Oxumaq Üçün)</label>
-                    <input disabled v-model="noteTitle" type="text" class="w-full p-4 bg-slate-100 text-slate-500 rounded-2xl border-none outline-none cursor-not-allowed font-medium">
+                    <label class="text-[10px] font-bold text-slate-400 uppercase block mb-2">Faylın Adı</label>
+                    <input disabled v-model="noteTitle" type="text" class="w-full p-4 bg-slate-100 text-slate-500 rounded-2xl border-none outline-none cursor-not-allowed font-medium break-words">
                 </div>
 
                 <div class="flex-1 flex flex-col min-h-0 mb-6">
@@ -911,13 +890,13 @@ const uiHTML = `
                     <div v-if="activeModal === 'folders'" class="grid grid-cols-2 gap-3">
                         <div v-for="v in virtualFolders" @click="searchFolder(v)" class="p-5 bg-slate-50 rounded-2xl border border-slate-100 hover:border-blue-400 hover:bg-blue-50 cursor-pointer transition">
                             <i data-lucide="folder" class="w-5 h-5 text-blue-500 mb-2"></i>
-                            <div class="text-sm font-bold text-slate-700">{{ v || 'Adsız' }}</div>
+                            <div class="text-sm font-bold text-slate-700 break-words">{{ v || 'Adsız' }}</div>
                         </div>
                     </div>
                     <div v-if="activeModal === 'recents'" class="space-y-3">
                         <div v-for="f in recents" @click="openFile(f)" class="p-4 bg-slate-50 rounded-2xl flex justify-between items-center cursor-pointer hover:bg-blue-50 transition">
-                            <span class="text-sm font-medium truncate w-64">{{ f.name }}</span>
-                            <span class="text-[10px] text-slate-400 font-bold uppercase">{{ formatDate(f.createdAt) }}</span>
+                            <span class="text-sm font-medium break-words flex-1 pr-4">{{ f.name }}</span>
+                            <span class="text-[10px] text-slate-400 font-bold uppercase flex-shrink-0">{{ formatDate(f.createdAt) }}</span>
                         </div>
                     </div>
                 </div>
@@ -926,7 +905,7 @@ const uiHTML = `
 
         <div v-if="editingFile" class="fixed inset-0 modal-overlay flex items-center justify-center p-6 z-[1000]">
             <div class="w-full max-w-md bg-white rounded-[40px] shadow-2xl border border-slate-100 p-10">
-                <h3 class="text-xl font-bold mb-2 truncate">{{ editingFile.name }}</h3>
+                <h3 class="text-xl font-bold mb-2 break-words">{{ editingFile.name }}</h3>
                 <p class="text-[10px] text-slate-400 uppercase tracking-widest mb-8">Fayl Redaktəsi</p>
 
                 <div class="mb-6">
@@ -938,8 +917,8 @@ const uiHTML = `
                 </div>
 
                 <div class="mb-10">
-                    <label class="text-[10px] font-bold text-slate-400 uppercase block mb-2">Virtual Qovluq</label>
-                    <input v-model="editingFile.vFolder" list="folder-list" class="w-full p-4 bg-slate-50 rounded-2xl border-none outline-none focus:ring-2 ring-blue-100">
+                    <label class="text-[10px] font-bold text-blue-500 uppercase block mb-2">Qovluq (Başqa qovluq seçib faylı köçürə bilərsiniz)</label>
+                    <input v-model="editingFile.vFolder" list="folder-list" placeholder="Qovluğun adını yazın..." class="w-full p-4 bg-slate-50 rounded-2xl border border-blue-100 outline-none focus:ring-2 ring-blue-200">
                     <datalist id="folder-list"><option v-for="v in virtualFolders" :value="v"></datalist>
                 </div>
 
@@ -966,6 +945,7 @@ const uiHTML = `
                     totalFiles: 0,
                     activeModal: null, 
                     editingFile: null, 
+                    oldFolderState: '', // Köçürməni anlamaq üçün köhnə qovluğun adını saxlayırıq
                     newTag: '',
                     dragActive: false, 
                     uploadingFile: null, 
@@ -986,6 +966,18 @@ const uiHTML = `
                 }
             },
             methods: {
+                // YENİ: Bildiriş icazəsini istəyirik və bildiriş göstəririk
+                requestNotifications() {
+                    if ("Notification" in window && Notification.permission !== "granted" && Notification.permission !== "denied") {
+                        Notification.requestPermission();
+                    }
+                },
+                notifyUser(message) {
+                    if ("Notification" in window && Notification.permission === "granted") {
+                        new Notification("ArxivGo", { body: message });
+                    }
+                },
+
                 async fetchMeta() {
                     const res = await fetch('/api/meta');
                     const data = await res.json();
@@ -1107,6 +1099,9 @@ const uiHTML = `
                         body: JSON.stringify(payload)
                     });
 
+                    // YENİ: Bildiriş
+                    this.notifyUser("Mətn faylı redaktə edildi: " + this.noteTitle);
+
                     this.activeModal = null;
                     this.editTextId = null;
                     this.noteContent = '';
@@ -1115,6 +1110,7 @@ const uiHTML = `
 
                 startEdit(file) {
                     this.editingFile = JSON.parse(JSON.stringify(file));
+                    this.oldFolderState = file.vFolder; // Dəyişikliyi yoxlamaq üçün
                     this.$nextTick(() => lucide.createIcons());
                 },
                 addTag() {
@@ -1126,6 +1122,14 @@ const uiHTML = `
                 removeTag(tag) { this.editingFile.tags = this.editingFile.tags.filter(t => t !== tag); },
                 async saveEdit() {
                     await fetch('/api/update', { method: 'POST', body: JSON.stringify(this.editingFile) });
+                    
+                    // YENİ: Bildiriş məntiqi. Qovluq dəyişibsə "Köçürüldü" mesajı
+                    if (this.oldFolderState !== this.editingFile.vFolder) {
+                        this.notifyUser("Fayl köçürüldü: " + this.editingFile.name);
+                    } else {
+                        this.notifyUser("Fayl məlumatları yeniləndi: " + this.editingFile.name);
+                    }
+
                     this.editingFile = null;
                     this.fetchMeta();
                     if (this.query) await this.performSearch(false); 
@@ -1164,6 +1168,9 @@ const uiHTML = `
 
                     await fetch('/api/upload', { method: 'POST', body: formData });
                     
+                    // YENİ: Bildiriş
+                    this.notifyUser("Yeni fayl əlavə edildi: " + this.uploadingFile.name);
+
                     this.uploadingFile = null;
                     this.fetchMeta();
                 },
@@ -1184,6 +1191,9 @@ const uiHTML = `
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify(payload)
                     });
+
+                    // YENİ: Bildiriş
+                    this.notifyUser("Yeni qeyd yaradıldı: " + this.noteTitle);
 
                     this.activeModal = null;
                     this.fetchMeta();
@@ -1210,6 +1220,7 @@ const uiHTML = `
                 }
             },
             mounted() {
+                this.requestNotifications(); // Veb səhifə açıldıqda bildiriş icazəsi istəyir
                 this.fetchMeta();
                 lucide.createIcons();
                 setInterval(this.fetchMeta, 5000);
