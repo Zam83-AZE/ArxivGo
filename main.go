@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -43,7 +44,6 @@ type MetaResponse struct {
 	TotalFiles     int        `json:"totalFiles"`
 }
 
-// YENİ: Qeyd yaratmaq üçün model
 type NoteRequest struct {
 	Title   string   `json:"title"`
 	Content string   `json:"content"`
@@ -92,7 +92,7 @@ func performScan(pathsToScan []string) {
 	state.mu.RLock()
 	existingPaths := make(map[string]bool, len(state.Files))
 	for _, f := range state.Files {
-		existingPaths[f.Path] = true
+		existingPaths[f.Path] = true 
 	}
 	state.mu.RUnlock()
 
@@ -164,9 +164,14 @@ func autoStartupScan() {
 func searchHandler(w http.ResponseWriter, r *http.Request) {
 	query := strings.ToLower(r.URL.Query().Get("q"))
 	folderFilter := r.URL.Query().Get("folder")
-	limit := 100 
+	
+	// YENİ: Pagination (Sonsuz Scroll) üçün offset və limit qəbul edirik
+	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit <= 0 { limit = 50 } // Default limit 50 olsun
 	
 	var results []FileData
+	matchCount := 0
 	
 	state.mu.RLock()
 	defer state.mu.RUnlock()
@@ -189,7 +194,12 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 			if !match { continue }
 		}
 
-		results = append(results, f)
+		// YENİ: Limit və Offset Məntiqi (Sürətli Süzmə)
+		if matchCount >= offset {
+			results = append(results, f)
+		}
+		matchCount++
+		
 		if len(results) >= limit { break }
 	}
 
@@ -308,7 +318,6 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// YENİ: Qeyd Yaratma (Create Note) Handleri
 func createNoteHandler(w http.ResponseWriter, r *http.Request) {
 	var req NoteRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -316,25 +325,19 @@ func createNoteHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Fayl adı üçün başlığı təmizləyirik (boşluqları alt xətt ilə əvəz edirik)
 	safeTitle := strings.ReplaceAll(req.Title, " ", "_")
 	safeTitle = strings.ReplaceAll(safeTitle, "/", "-")
 	safeTitle = strings.ReplaceAll(safeTitle, "\\", "-")
-	
-	if safeTitle == "" {
-		safeTitle = "Adsiz_Qeyd"
-	}
+	if safeTitle == "" { safeTitle = "Adsiz_Qeyd" }
 	
 	fileName := safeTitle + ".txt"
 	destPath := filepath.Join(storageFolder, fileName)
 
-	// Əgər eyni adlı qeyd varsa, sonuna vaxt (timestamp) artırırıq
 	if _, err := os.Stat(destPath); err == nil {
 		fileName = fmt.Sprintf("%s_%d.txt", safeTitle, time.Now().Unix())
 		destPath = filepath.Join(storageFolder, fileName)
 	}
 
-	// .txt faylını fiziki olaraq Storage qovluğuna yazırıq
 	err := os.WriteFile(destPath, []byte(req.Content), 0644)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
@@ -342,7 +345,6 @@ func createNoteHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	absPath, _ := filepath.Abs(destPath)
-	
 	hash := md5.Sum([]byte(absPath))
 	uniqueID := hex.EncodeToString(hash[:])
 
@@ -389,6 +391,7 @@ func openFileHandler(w http.ResponseWriter, r *http.Request) {
 	if targetPath != "" {
 		switch runtime.GOOS {
 		case "windows": 
+			// YENİ: Səssiz açılış (Brauzerdə heç bir reaksiya olmadan OS-də açılır)
 			exec.Command("rundll32", "url.dll,FileProtocolHandler", targetPath).Start()
 			fmt.Fprint(w, "Opened on Windows")
 		case "darwin":  
@@ -413,7 +416,7 @@ func main() {
 	http.HandleFunc("/api/meta", metaHandler)     
 	http.HandleFunc("/api/update", updateHandler)
 	http.HandleFunc("/api/upload", uploadHandler)
-	http.HandleFunc("/api/create-note", createNoteHandler) // YENİ: Note API-si
+	http.HandleFunc("/api/create-note", createNoteHandler)
 	http.HandleFunc("/api/scan", scanHandler)
 	http.HandleFunc("/api/open", openFileHandler)
 
@@ -432,7 +435,7 @@ const uiHTML = `
 <html lang="az">
 <head>
     <meta charset="UTF-8">
-    <title>ArxivGo | Performance Edition</title>
+    <title>ArxivGo | Pro Edition</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
@@ -441,8 +444,8 @@ const uiHTML = `
         body { font-family: 'Inter', sans-serif; background-color: #fff; color: #1e293b; margin:0; padding:0; overflow: hidden; }
         .search-container:focus-within { ring: 4px solid #eff6ff; border-color: #3b82f6; }
         .modal-overlay { background: rgba(255, 255, 255, 0.98); backdrop-filter: blur(10px); z-index: 100; }
-        .custom-scroll::-webkit-scrollbar { width: 4px; }
-        .custom-scroll::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 10px; }
+        .custom-scroll::-webkit-scrollbar { width: 6px; }
+        .custom-scroll::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
         .drop-zone-active { z-index: 9999; opacity: 1; pointer-events: all; }
         .drop-zone-inactive { z-index: -1; opacity: 0; pointer-events: none; }
     </style>
@@ -459,7 +462,7 @@ const uiHTML = `
         </div>
 
         <div class="w-full max-w-2xl px-6 relative z-10">
-            <div v-if="!activeModal && !editingFile && !uploadingFile" class="text-center">
+            <div v-if="!activeModal && !editingFile && !uploadingFile" class="text-center relative">
                 <h1 class="text-5xl font-light mb-1 select-none">Arxiv<span class="font-bold text-blue-600">Go</span></h1>
                 <p class="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-10">Cəmi Fayl: {{ totalFiles }}</p>
 
@@ -469,8 +472,10 @@ const uiHTML = `
                     <div v-if="isSearching" class="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
                 </div>
 
-                <div v-if="searchResults.length > 0" class="absolute w-full left-0 max-w-2xl mx-auto mt-[-20px] bg-white border border-slate-100 rounded-3xl shadow-2xl z-50 overflow-hidden text-left max-h-[60vh] custom-scroll overflow-y-auto">
-                    <div v-for="f in searchResults" :key="f.id" class="px-6 py-4 hover:bg-blue-50/50 flex justify-between items-center group cursor-pointer border-b border-slate-50 last:border-0">
+                <div v-if="searchResults.length > 0" 
+                     @scroll="handleScroll"
+                     class="absolute w-full left-0 max-w-2xl mx-auto mt-2 bg-white border border-slate-100 rounded-3xl shadow-2xl z-50 overflow-hidden text-left max-h-[50vh] custom-scroll overflow-y-auto flex flex-col pb-4">
+                    <div v-for="f in searchResults" :key="f.id" class="px-6 py-4 hover:bg-blue-50/50 flex justify-between items-center group cursor-pointer border-b border-slate-50 last:border-0 shrink-0">
                         <div @click="openFile(f.id)" class="flex-1 flex items-center gap-4">
                             <i data-lucide="file" class="w-5 h-5 text-slate-300"></i>
                             <div>
@@ -485,9 +490,12 @@ const uiHTML = `
                             <i data-lucide="edit-3" class="w-4 h-4"></i>
                         </button>
                     </div>
+                    <div v-if="isLoadingMore" class="py-4 text-center text-xs font-bold text-slate-400 flex justify-center items-center gap-2">
+                        <div class="w-3 h-3 border-2 border-slate-400 border-t-transparent rounded-full animate-spin"></div> Yüklənir...
+                    </div>
                 </div>
 
-                <div class="flex justify-center gap-3">
+                <div class="flex justify-center gap-3" :class="searchResults.length > 0 ? 'mt-4' : ''">
                     <button @click="openModal('folders')" class="px-5 py-2 rounded-xl bg-slate-50 text-slate-600 text-xs font-bold hover:bg-slate-100 transition uppercase tracking-widest border border-slate-100">Virtual Qovluqlar</button>
                     <button @click="openModal('recents')" class="px-5 py-2 rounded-xl bg-slate-50 text-slate-600 text-xs font-bold hover:bg-slate-100 transition uppercase tracking-widest border border-slate-100">Son Əlavələr</button>
                     <button @click="openModal('note')" class="px-5 py-2 rounded-xl bg-green-50 text-green-600 text-xs font-bold hover:bg-green-100 transition uppercase tracking-widest border border-green-100 flex items-center gap-2"><i data-lucide="plus-circle" class="w-4 h-4"></i> Yeni Qeyd</button>
@@ -634,9 +642,15 @@ const uiHTML = `
                     uploadVFolder: '',
                     searchTimeout: null,
                     isSearching: false,
-                    // Qeyd yaratmaq üçün yeni dəyişənlər
                     noteTitle: '',
-                    noteContent: ''
+                    noteContent: '',
+                    
+                    // YENİ: Sonsuz Scroll üçün dəyişənlər
+                    offset: 0,
+                    limit: 50,
+                    hasMore: true,
+                    isLoadingMore: false,
+                    currentFolderFilter: ''
                 }
             },
             methods: {
@@ -649,30 +663,77 @@ const uiHTML = `
                         this.totalFiles = data.totalFiles || 0;
                     }
                 },
+                // YENİ: Sürətli Axtarış və Sonsuz Scroll Məntiqi
+                async performSearch(isAppend = false) {
+                    if (!isAppend) {
+                        this.offset = 0;
+                        this.searchResults = [];
+                        this.hasMore = true;
+                    }
+
+                    let url = '/api/search?limit=' + this.limit + '&offset=' + this.offset;
+                    if (this.currentFolderFilter) {
+                        url += '&folder=' + encodeURIComponent(this.currentFolderFilter);
+                    } else if (this.query) {
+                        url += '&q=' + encodeURIComponent(this.query);
+                    } else {
+                        return; // Boş axtarış
+                    }
+
+                    const res = await fetch(url);
+                    const data = await res.json() || [];
+
+                    if (isAppend) {
+                        this.searchResults.push(...data);
+                    } else {
+                        this.searchResults = data;
+                    }
+
+                    if (data.length < this.limit) {
+                        this.hasMore = false; // Əgər gələn data limitdən azdırsa, demək sonuncu səhifədir
+                    }
+                    this.offset += data.length;
+                },
                 onSearchInput() {
                     clearTimeout(this.searchTimeout);
+                    this.currentFolderFilter = ''; // Folder filtrini sıfırla
+                    
                     if (this.query.length === 0) {
                         this.searchResults = [];
                         this.isSearching = false;
                         return;
                     }
+                    
                     this.isSearching = true;
                     this.searchTimeout = setTimeout(async () => {
-                        const res = await fetch('/api/search?q=' + encodeURIComponent(this.query));
-                        this.searchResults = await res.json() || [];
+                        await this.performSearch(false);
                         this.isSearching = false;
                     }, 300);
                 },
                 async searchFolder(folderName) {
                     this.activeModal = null;
                     this.query = "Qovluq: " + folderName;
+                    this.currentFolderFilter = folderName;
                     this.isSearching = true;
-                    const res = await fetch('/api/search?folder=' + encodeURIComponent(folderName));
-                    this.searchResults = await res.json() || [];
+                    await this.performSearch(false);
                     this.isSearching = false;
                 },
+                // YENİ: Scroll olunduqda avtomatik əlavə yükləmə
+                async handleScroll(e) {
+                    const { scrollTop, clientHeight, scrollHeight } = e.target;
+                    // Siyahının sonuna 20px qalmış yeni məlumatları çək
+                    if (scrollTop + clientHeight >= scrollHeight - 20) {
+                        if (this.hasMore && !this.isLoadingMore) {
+                            this.isLoadingMore = true;
+                            await this.performSearch(true);
+                            this.isLoadingMore = false;
+                        }
+                    }
+                },
+                // YENİ: Səssiz Açılış (Yeni Tab Açmadan)
                 async openFile(id) {
-                    window.open('/api/open?id=' + id, '_blank');
+                    // Sadəcə arxa planda Go-ya siqnal veririk. Əməliyyat sistemi faylı açacaq.
+                    await fetch('/api/open?id=' + id);
                     setTimeout(() => this.fetchMeta(), 1000);
                 },
                 startEdit(file) {
@@ -690,7 +751,8 @@ const uiHTML = `
                     await fetch('/api/update', { method: 'POST', body: JSON.stringify(this.editingFile) });
                     this.editingFile = null;
                     this.fetchMeta();
-                    this.onSearchInput(); 
+                    // Əgər ekranda siyahı varsa, səhifəni sıfırlayıb yenidən axtar
+                    if (this.query) await this.performSearch(false); 
                 },
                 
                 onDragEnter(e) { e.preventDefault(); this.dragActive = true; },
@@ -729,7 +791,6 @@ const uiHTML = `
                     this.uploadingFile = null;
                     this.fetchMeta();
                 },
-                // YENİ: Qeyd Yaratma Funksiyası
                 async saveNote() {
                     if (!this.noteTitle.trim() || !this.noteContent.trim()) {
                         alert("Zəhmət olmasa, başlıq və məzmunu daxil edin.");
@@ -750,11 +811,10 @@ const uiHTML = `
 
                     this.activeModal = null;
                     this.fetchMeta();
-                    if (this.query) this.onSearchInput();
+                    if (this.query) await this.performSearch(false);
                 },
                 openModal(type) {
                     this.activeModal = type;
-                    // Yeni qeyd və ya fayl yükləmə paneli açıldıqda inputları təmizlə
                     if (type === 'note' || type === 'upload') {
                         this.uploadTags = [];
                         this.uploadVFolder = '';
