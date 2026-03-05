@@ -54,7 +54,6 @@ type NoteRequest struct {
 
 const dbPath = "data.json"
 const storageFolder = "ArxivGo_Storage"
-
 var state AppState
 
 // --- BACKEND MƏNTİQİ ---
@@ -94,7 +93,7 @@ func performScan(pathsToScan []string) {
 	state.mu.RLock()
 	existingPaths := make(map[string]bool, len(state.Files))
 	for _, f := range state.Files {
-		existingPaths[f.Path] = true
+		existingPaths[f.Path] = true 
 	}
 	state.mu.RUnlock()
 
@@ -102,10 +101,8 @@ func performScan(pathsToScan []string) {
 
 	for _, dir := range pathsToScan {
 		filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return nil
-			}
-
+			if err != nil { return nil }
+			
 			if d.IsDir() {
 				name := d.Name()
 				if name == ".git" || name == "node_modules" || name == "Windows" || name == "AppData" || name == "sys" {
@@ -135,7 +132,7 @@ func performScan(pathsToScan []string) {
 		state.mu.Lock()
 		state.Files = append(state.Files, newFiles...)
 		state.mu.Unlock()
-
+		
 		go saveDB()
 		fmt.Printf("✅ Skan bitdi: %d yeni fayl tapıldı!\n", len(newFiles))
 	}
@@ -168,18 +165,16 @@ func autoStartupScan() {
 func searchHandler(w http.ResponseWriter, r *http.Request) {
 	query := strings.ToLower(r.URL.Query().Get("q"))
 	folderFilter := r.URL.Query().Get("folder")
-
+	
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	if limit <= 0 {
-		limit = 50
-	}
-
+	if limit <= 0 { limit = 50 } 
+	
 	var tagMatches []FileData
 	var nameMatches []FileData
-
+	
 	targetCount := offset + limit
-
+	
 	state.mu.RLock()
 	defer state.mu.RUnlock()
 
@@ -192,9 +187,7 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 			if len(nameMatches) < targetCount {
 				nameMatches = append(nameMatches, f)
 			}
-			if len(nameMatches) >= targetCount {
-				break
-			}
+			if len(nameMatches) >= targetCount { break }
 			continue
 		}
 
@@ -302,22 +295,16 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	state.mu.Unlock()
-	go saveDB()
+	go saveDB() 
 	w.WriteHeader(http.StatusOK)
 }
 
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	err := r.ParseMultipartForm(500 << 20)
-	if err != nil {
-		http.Error(w, err.Error(), 400)
-		return
-	}
+	if err != nil { http.Error(w, err.Error(), 400); return }
 
 	file, handler, err := r.FormFile("file")
-	if err != nil {
-		http.Error(w, err.Error(), 400)
-		return
-	}
+	if err != nil { http.Error(w, err.Error(), 400); return }
 	defer file.Close()
 
 	tagsJSON := r.FormValue("tags")
@@ -325,10 +312,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	destPath := filepath.Join(storageFolder, handler.Filename)
 	destFile, err := os.Create(destPath)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
+	if err != nil { http.Error(w, err.Error(), 500); return }
 	defer destFile.Close()
 
 	io.Copy(destFile, file)
@@ -339,7 +323,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	absPath, _ := filepath.Abs(destPath)
-
+	
 	hash := md5.Sum([]byte(absPath))
 	uniqueID := hex.EncodeToString(hash[:])
 
@@ -370,10 +354,8 @@ func createNoteHandler(w http.ResponseWriter, r *http.Request) {
 	safeTitle := strings.ReplaceAll(req.Title, " ", "_")
 	safeTitle = strings.ReplaceAll(safeTitle, "/", "-")
 	safeTitle = strings.ReplaceAll(safeTitle, "\\", "-")
-	if safeTitle == "" {
-		safeTitle = "Adsiz_Qeyd"
-	}
-
+	if safeTitle == "" { safeTitle = "Adsiz_Qeyd" }
+	
 	fileName := safeTitle + ".txt"
 	destPath := filepath.Join(storageFolder, fileName)
 
@@ -411,8 +393,8 @@ func createNoteHandler(w http.ResponseWriter, r *http.Request) {
 
 func scanHandler(w http.ResponseWriter, r *http.Request) {
 	dir := r.URL.Query().Get("path")
-	if dir != "" {
-		go performScan([]string{dir})
+	if dir != "" { 
+		go performScan([]string{dir}) 
 	}
 	fmt.Fprint(w, "Scan initiated")
 }
@@ -435,13 +417,13 @@ func openFileHandler(w http.ResponseWriter, r *http.Request) {
 
 	if targetPath != "" {
 		switch runtime.GOOS {
-		case "windows":
+		case "windows": 
 			exec.Command("cmd", "/C", "start", "", targetPath).Start()
 			fmt.Fprint(w, "Opened on Windows")
-		case "darwin":
+		case "darwin":  
 			exec.Command("open", targetPath).Start()
 			fmt.Fprint(w, "Opened on Mac")
-		default:
+		default:        
 			exec.Command("xdg-open", targetPath).Start()
 			fmt.Fprint(w, "Opened on Linux")
 		}
@@ -455,11 +437,13 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	state.mu.Lock()
 	var targetPath string
+	var fileName string
 	for i, f := range state.Files {
 		if f.ID == id {
 			state.Files[i].Reads++
 			state.Files[i].LastAccessed = time.Now()
 			targetPath = f.Path
+			fileName = f.Name
 			break
 		}
 	}
@@ -467,11 +451,23 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	go saveDB()
 
 	if targetPath != "" {
+		// MÜHÜM YENİLİK: Faylın uzantısını tapırıq
+		ext := strings.ToLower(filepath.Ext(fileName))
+		
+		// Əgər fayl brauzerdə oxuna biləndirsə (şəkil, pdf, video, mətn), inline edirik (yeni tabda açılır)
+		if ext == ".pdf" || ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".txt" || ext == ".mp4" || ext == ".webp" {
+			w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=\"%s\"", fileName))
+		} else {
+			// .docx, .xlsx, .zip və s. kimi fayllar məcburi olaraq öz əsl adları ilə yüklənir
+			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", fileName))
+		}
+
 		http.ServeFile(w, r, targetPath)
 	} else {
 		http.Error(w, "Fayl tapılmadı", http.StatusNotFound)
 	}
 }
+
 
 // --- MAIN ---
 
@@ -480,8 +476,8 @@ func main() {
 	loadDB()
 	go autoStartupScan()
 
-	http.HandleFunc("/api/search", searchHandler)
-	http.HandleFunc("/api/meta", metaHandler)
+	http.HandleFunc("/api/search", searchHandler) 
+	http.HandleFunc("/api/meta", metaHandler)     
 	http.HandleFunc("/api/update", updateHandler)
 	http.HandleFunc("/api/upload", uploadHandler)
 	http.HandleFunc("/api/create-note", createNoteHandler)
@@ -501,9 +497,9 @@ func main() {
 	for {
 		listener, err = net.Listen("tcp", fmt.Sprintf(":%d", port))
 		if err == nil {
-			break
+			break 
 		}
-		port++
+		port++ 
 	}
 
 	fmt.Printf("🚀 Server %d portunda hazırdır. UI: http://localhost:%d\n", port, port)
