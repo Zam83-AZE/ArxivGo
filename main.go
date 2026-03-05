@@ -417,6 +417,7 @@ func scanHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, "Scan initiated")
 }
 
+// 1. LOKAL AÇILIŞ (Serverin özündə işləyəndə OS-də açır)
 func openFileHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	state.mu.Lock()
@@ -449,6 +450,29 @@ func openFileHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// 2. ŞƏBƏKƏ/KƏNAR AÇILIŞ (Müştəri başqa cihazdadırsa brauzerə xidmət edir/yükləyir)
+func downloadHandler(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	state.mu.Lock()
+	var targetPath string
+	for i, f := range state.Files {
+		if f.ID == id {
+			state.Files[i].Reads++
+			state.Files[i].LastAccessed = time.Now()
+			targetPath = f.Path
+			break
+		}
+	}
+	state.mu.Unlock()
+	go saveDB()
+
+	if targetPath != "" {
+		http.ServeFile(w, r, targetPath)
+	} else {
+		http.Error(w, "Fayl tapılmadı", http.StatusNotFound)
+	}
+}
+
 // --- MAIN ---
 
 func main() {
@@ -463,13 +487,13 @@ func main() {
 	http.HandleFunc("/api/create-note", createNoteHandler)
 	http.HandleFunc("/api/scan", scanHandler)
 	http.HandleFunc("/api/open", openFileHandler)
+	http.HandleFunc("/api/download", downloadHandler) // YENİ: Başqa cihazdan açmaq üçün
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		fmt.Fprint(w, uiHTML)
 	})
 
-	// MÜHÜM YENİLİK: Avtomatik boş port tapan məntiq
 	port := 8080
 	var listener net.Listener
 	var err error
@@ -477,9 +501,9 @@ func main() {
 	for {
 		listener, err = net.Listen("tcp", fmt.Sprintf(":%d", port))
 		if err == nil {
-			break // Boş port tapıldı!
+			break
 		}
-		port++ // Əgər port doludursa, 8081, 8082 kimi yuxarı qalxır
+		port++
 	}
 
 	fmt.Printf("🚀 Server %d portunda hazırdır. UI: http://localhost:%d\n", port, port)
@@ -792,8 +816,19 @@ const uiHTML = `
                         }
                     }
                 },
+                // YENİ: HİBRİD AÇILIŞ MƏNTİQİ
                 async openFile(id) {
-                    await fetch('/api/open?id=' + id);
+                    const host = window.location.hostname;
+                    // Əgər kompyuterin özündəyiksə (localhost)
+                    const isLocal = (host === 'localhost' || host === '127.0.0.1' || host === '[::1]');
+                    
+                    if (isLocal) {
+                        // Səssizcə OS-də açır (Köhnə və sevimli qayda)
+                        await fetch('/api/open?id=' + id);
+                    } else {
+                        // Əgər telefondan/başqa PC-dən daxil olmuşuqsa, brauzerdə aç və ya yüklə
+                        window.open('/api/download?id=' + id, '_blank');
+                    }
                     setTimeout(() => this.fetchMeta(), 1000);
                 },
                 startEdit(file) {
