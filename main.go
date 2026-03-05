@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -174,7 +175,6 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 		limit = 50
 	}
 
-	// İki fərqli siyahı (səbət) yaradırıq.
 	var tagMatches []FileData
 	var nameMatches []FileData
 
@@ -435,7 +435,6 @@ func openFileHandler(w http.ResponseWriter, r *http.Request) {
 	if targetPath != "" {
 		switch runtime.GOOS {
 		case "windows":
-			// MÜHÜM YENİLİK: Bütün Unicode (Azərbaycan/Rus) hərflərini dəstəkləyən qüsursuz açılış əmri!
 			exec.Command("cmd", "/C", "start", "", targetPath).Start()
 			fmt.Fprint(w, "Opened on Windows")
 		case "darwin":
@@ -470,8 +469,21 @@ func main() {
 		fmt.Fprint(w, uiHTML)
 	})
 
-	fmt.Println("🚀 Server 8080 portunda hazırdır. UI: http://localhost:8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	// MÜHÜM YENİLİK: Avtomatik boş port tapan məntiq
+	port := 8080
+	var listener net.Listener
+	var err error
+
+	for {
+		listener, err = net.Listen("tcp", fmt.Sprintf(":%d", port))
+		if err == nil {
+			break // Boş port tapıldı!
+		}
+		port++ // Əgər port doludursa, 8081, 8082 kimi yuxarı qalxır
+	}
+
+	fmt.Printf("🚀 Server %d portunda hazırdır. UI: http://localhost:%d\n", port, port)
+	log.Fatal(http.Serve(listener, nil))
 }
 
 // --- UI (FRONTEND) ---
