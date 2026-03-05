@@ -57,12 +57,26 @@ type UpdateContentRequest struct {
 	Content string `json:"content"`
 }
 
+// YENİ: Veb tərəfə dəqiq məlumat (versiya, köçürülmə və s.) qaytarmaq üçün
+type APIResponse struct {
+	Success   bool   `json:"success"`
+	Message   string `json:"message"`
+	Versioned bool   `json:"versioned"`
+	Moved     bool   `json:"moved"`
+	FileName  string `json:"fileName"`
+}
+
 const dbPath = "data.json"
 const storageFolder = "ArxivGo_Storage"
 
 var state AppState
 
 // --- KÖMƏKÇİ FUNKSİYALAR ---
+
+func sendJSON(w http.ResponseWriter, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(data)
+}
 
 func getNextVersion(dir, filename string) (string, string) {
 	ext := filepath.Ext(filename)
@@ -132,7 +146,6 @@ func performScan(pathsToScan []string) {
 			if err != nil {
 				return nil
 			}
-
 			if d.IsDir() {
 				name := d.Name()
 				if name == ".git" || name == "node_modules" || name == "Windows" || name == "AppData" || name == "sys" {
@@ -140,7 +153,6 @@ func performScan(pathsToScan []string) {
 				}
 				return nil
 			}
-
 			if !existingPaths[path] {
 				hash := md5.Sum([]byte(path))
 				uniqueID := hex.EncodeToString(hash[:])
@@ -162,7 +174,6 @@ func performScan(pathsToScan []string) {
 		state.mu.Lock()
 		state.Files = append(state.Files, newFiles...)
 		state.mu.Unlock()
-
 		go saveDB()
 		fmt.Printf("✅ Skan bitdi: %d yeni fayl tapıldı!\n", len(newFiles))
 	}
@@ -214,7 +225,6 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 		if folderFilter != "" && f.VFolder != folderFilter {
 			continue
 		}
-
 		if query == "" {
 			if len(nameMatches) < targetCount {
 				nameMatches = append(nameMatches, f)
@@ -273,8 +283,8 @@ func metaHandler(w http.ResponseWriter, r *http.Request) {
 
 	foldersMap := make(map[string]bool)
 	var recents []FileData
-
 	var recentCandidates []FileData
+
 	if len(state.Files) > 100 {
 		recentCandidates = make([]FileData, 100)
 		copy(recentCandidates, state.Files[len(state.Files)-100:])
@@ -320,6 +330,10 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
+
+	isMoved := false
+	finalName := updated.Name
+
 	state.mu.Lock()
 	for i, f := range state.Files {
 		if f.ID == updated.ID {
@@ -330,34 +344,41 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 
 				newDir := storageFolder
 				if updated.VFolder != "" {
-					newDir = filepath.Join(storageFolder, updated.VFolder)
+					// filepath.Join alt qovluqları (A/B/C) avtomatik düzgün yola çevirir
+					newDir = filepath.Join(storageFolder, filepath.FromSlash(updated.VFolder))
 				}
 				os.MkdirAll(newDir, 0755)
 
 				newPath := filepath.Join(newDir, filepath.Base(oldPath))
 
-				err := os.Rename(oldPath, newPath)
-				if err != nil {
-					input, errRead := os.ReadFile(oldPath)
-					if errRead == nil {
-						errWrite := os.WriteFile(newPath, input, 0644)
-						if errWrite == nil {
-							os.Remove(oldPath)
-							state.Files[i].Path = newPath
+				if oldPath != newPath {
+					err := os.Rename(oldPath, newPath)
+					if err != nil {
+						input, errRead := os.ReadFile(oldPath)
+						if errRead == nil {
+							errWrite := os.WriteFile(newPath, input, 0644)
+							if errWrite == nil {
+								os.Remove(oldPath)
+								state.Files[i].Path = newPath
+								isMoved = true
+							}
 						}
+					} else {
+						state.Files[i].Path = newPath
+						isMoved = true
 					}
-				} else {
-					state.Files[i].Path = newPath
 				}
 			}
 
 			state.Files[i].VFolder = updated.VFolder
+			finalName = state.Files[i].Name
 			break
 		}
 	}
 	state.mu.Unlock()
 	go saveDB()
-	w.WriteHeader(http.StatusOK)
+
+	sendJSON(w, APIResponse{Success: true, Moved: isMoved, FileName: finalName})
 }
 
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
@@ -379,17 +400,19 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	destDir := storageFolder
 	if vFolder != "" {
-		destDir = filepath.Join(storageFolder, vFolder)
+		destDir = filepath.Join(storageFolder, filepath.FromSlash(vFolder))
 		os.MkdirAll(destDir, 0755)
 	}
 
 	finalName := handler.Filename
 	destPath := filepath.Join(destDir, finalName)
 
+	isVersioned := false
 	info, err := os.Stat(destPath)
 	if err == nil {
 		if info.Size() != handler.Size {
 			finalName, destPath = getNextVersion(destDir, handler.Filename)
+			isVersioned = true
 		}
 	}
 
@@ -437,7 +460,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	state.mu.Unlock()
 	go saveDB()
 
-	w.WriteHeader(http.StatusOK)
+	sendJSON(w, APIResponse{Success: true, Versioned: isVersioned, FileName: finalName})
 }
 
 func createNoteHandler(w http.ResponseWriter, r *http.Request) {
@@ -457,14 +480,16 @@ func createNoteHandler(w http.ResponseWriter, r *http.Request) {
 	fileName := safeTitle + ".txt"
 	destDir := storageFolder
 	if req.VFolder != "" {
-		destDir = filepath.Join(storageFolder, req.VFolder)
+		destDir = filepath.Join(storageFolder, filepath.FromSlash(req.VFolder))
 		os.MkdirAll(destDir, 0755)
 	}
 
 	destPath := filepath.Join(destDir, fileName)
 
+	isVersioned := false
 	if _, err := os.Stat(destPath); err == nil {
 		fileName, destPath = getNextVersion(destDir, fileName)
+		isVersioned = true
 	}
 
 	err := os.WriteFile(destPath, []byte(req.Content), 0644)
@@ -491,7 +516,7 @@ func createNoteHandler(w http.ResponseWriter, r *http.Request) {
 	state.mu.Unlock()
 	go saveDB()
 
-	w.WriteHeader(http.StatusOK)
+	sendJSON(w, APIResponse{Success: true, Versioned: isVersioned, FileName: fileName})
 }
 
 func scanHandler(w http.ResponseWriter, r *http.Request) {
@@ -660,7 +685,7 @@ func updateFileContentHandler(w http.ResponseWriter, r *http.Request) {
 	state.mu.Unlock()
 
 	go saveDB()
-	w.WriteHeader(http.StatusOK)
+	sendJSON(w, APIResponse{Success: true, Versioned: isVersioned, FileName: finalName})
 }
 
 func main() {
@@ -801,8 +826,12 @@ const uiHTML = `
                 </div>
 
                 <div class="mb-10">
-                    <label class="text-[10px] font-bold text-slate-400 uppercase block mb-2">Qovluq</label>
-                    <input v-model="uploadVFolder" list="folder-list" class="w-full p-4 bg-slate-50 rounded-2xl border-none outline-none focus:ring-2 ring-blue-100">
+                    <label class="text-[10px] font-bold text-slate-400 uppercase block mb-2">Qovluq Seç və ya Yaz</label>
+                    <div class="flex flex-wrap gap-2 mb-3" v-if="virtualFolders.length > 0">
+                        <span v-for="v in virtualFolders" @click="uploadVFolder = v" class="text-[10px] bg-blue-50 text-blue-600 px-3 py-1.5 rounded-lg cursor-pointer hover:bg-blue-600 hover:text-white transition font-bold border border-blue-100">{{ v }}</span>
+                    </div>
+                    <input v-model="uploadVFolder" placeholder="Məsələn: Sənədlər/Hesabatlar..." class="w-full p-4 bg-slate-50 rounded-2xl border-none outline-none focus:ring-2 ring-blue-100">
+                    <p class="text-[9px] text-slate-400 mt-2">* Alt qovluq yaratmaq üçün '/' istifadə edin (Məsələn: Əsas/AltQovluq)</p>
                 </div>
 
                 <div class="flex gap-3">
@@ -839,8 +868,12 @@ const uiHTML = `
                     </div>
 
                     <div class="mb-6">
-                        <label class="text-[10px] font-bold text-slate-400 uppercase block mb-2">Qovluq</label>
-                        <input v-model="uploadVFolder" list="folder-list" class="w-full p-4 bg-slate-50 rounded-2xl border-none outline-none focus:ring-2 ring-green-100">
+                        <label class="text-[10px] font-bold text-slate-400 uppercase block mb-2">Qovluq Seç və ya Yaz</label>
+                        <div class="flex flex-wrap gap-2 mb-3" v-if="virtualFolders.length > 0">
+                            <span v-for="v in virtualFolders" @click="uploadVFolder = v" class="text-[10px] bg-green-50 text-green-600 px-3 py-1.5 rounded-lg cursor-pointer hover:bg-green-600 hover:text-white transition font-bold border border-green-100">{{ v }}</span>
+                        </div>
+                        <input v-model="uploadVFolder" placeholder="Məsələn: Fikirlər/Yeni İdeyalar..." class="w-full p-4 bg-slate-50 rounded-2xl border-none outline-none focus:ring-2 ring-green-100">
+                        <p class="text-[9px] text-slate-400 mt-2">* Alt qovluq yaratmaq üçün '/' istifadə edin.</p>
                     </div>
                 </div>
 
@@ -904,25 +937,30 @@ const uiHTML = `
         </div>
 
         <div v-if="editingFile" class="fixed inset-0 modal-overlay flex items-center justify-center p-6 z-[1000]">
-            <div class="w-full max-w-md bg-white rounded-[40px] shadow-2xl border border-slate-100 p-10">
-                <h3 class="text-xl font-bold mb-2 break-words">{{ editingFile.name }}</h3>
-                <p class="text-[10px] text-slate-400 uppercase tracking-widest mb-8">Fayl Redaktəsi</p>
+            <div class="w-full max-w-md bg-white rounded-[40px] shadow-2xl border border-slate-100 p-10 flex flex-col max-h-[90vh]">
+                <div class="overflow-y-auto custom-scroll pr-2 mb-4">
+                    <h3 class="text-xl font-bold mb-2 break-words">{{ editingFile.name }}</h3>
+                    <p class="text-[10px] text-slate-400 uppercase tracking-widest mb-8">Fayl Redaktəsi</p>
 
-                <div class="mb-6">
-                    <label class="text-[10px] font-bold text-slate-400 uppercase block mb-2">Teqlər</label>
-                    <div class="flex flex-wrap gap-2 p-3 bg-slate-50 rounded-2xl border border-slate-100">
-                        <span v-for="t in editingFile.tags" @click="removeTag(t)" class="bg-white text-blue-600 px-3 py-1 rounded-full text-xs font-bold border border-blue-100 cursor-pointer hover:bg-red-50 hover:text-red-500 hover:border-red-100 transition">#{{ t }}</span>
-                        <input v-model="newTag" @keyup.enter="addTag" placeholder="..." class="bg-transparent outline-none text-xs flex-1">
+                    <div class="mb-6">
+                        <label class="text-[10px] font-bold text-slate-400 uppercase block mb-2">Teqlər</label>
+                        <div class="flex flex-wrap gap-2 p-3 bg-slate-50 rounded-2xl border border-slate-100">
+                            <span v-for="t in editingFile.tags" @click="removeTag(t)" class="bg-white text-blue-600 px-3 py-1 rounded-full text-xs font-bold border border-blue-100 cursor-pointer hover:bg-red-50 hover:text-red-500 hover:border-red-100 transition">#{{ t }}</span>
+                            <input v-model="newTag" @keyup.enter="addTag" placeholder="..." class="bg-transparent outline-none text-xs flex-1">
+                        </div>
+                    </div>
+
+                    <div class="mb-4">
+                        <label class="text-[10px] font-bold text-blue-500 uppercase block mb-2">Qovluq (Mövcudu seç və ya köçür)</label>
+                        <div class="flex flex-wrap gap-2 mb-3" v-if="virtualFolders.length > 0">
+                            <span v-for="v in virtualFolders" @click="editingFile.vFolder = v" class="text-[10px] bg-blue-50 text-blue-600 px-3 py-1.5 rounded-lg cursor-pointer hover:bg-blue-600 hover:text-white transition font-bold border border-blue-100">{{ v }}</span>
+                        </div>
+                        <input v-model="editingFile.vFolder" placeholder="Qovluğun adını yazın..." class="w-full p-4 bg-slate-50 rounded-2xl border border-blue-100 outline-none focus:ring-2 ring-blue-200">
+                        <p class="text-[9px] text-slate-400 mt-2">* Yeni alt qovluğa köçürmək üçün adın sonuna '/' qoyun (Məsələn: Əsas/AltQovluq)</p>
                     </div>
                 </div>
 
-                <div class="mb-10">
-                    <label class="text-[10px] font-bold text-blue-500 uppercase block mb-2">Qovluq (Başqa qovluq seçib faylı köçürə bilərsiniz)</label>
-                    <input v-model="editingFile.vFolder" list="folder-list" placeholder="Qovluğun adını yazın..." class="w-full p-4 bg-slate-50 rounded-2xl border border-blue-100 outline-none focus:ring-2 ring-blue-200">
-                    <datalist id="folder-list"><option v-for="v in virtualFolders" :value="v"></datalist>
-                </div>
-
-                <div class="flex gap-3">
+                <div class="flex gap-3 mt-auto">
                     <button @click="saveEdit" class="flex-1 bg-blue-600 text-white py-4 rounded-2xl font-bold hover:bg-blue-700 transition">Yadda Saxla</button>
                     <button @click="editingFile = null" class="px-8 py-4 bg-slate-100 text-slate-400 rounded-2xl font-bold hover:bg-slate-200 transition">Ləğv Et</button>
                 </div>
@@ -945,7 +983,6 @@ const uiHTML = `
                     totalFiles: 0,
                     activeModal: null, 
                     editingFile: null, 
-                    oldFolderState: '', // Köçürməni anlamaq üçün köhnə qovluğun adını saxlayırıq
                     newTag: '',
                     dragActive: false, 
                     uploadingFile: null, 
@@ -966,15 +1003,18 @@ const uiHTML = `
                 }
             },
             methods: {
-                // YENİ: Bildiriş icazəsini istəyirik və bildiriş göstəririk
-                requestNotifications() {
-                    if ("Notification" in window && Notification.permission !== "granted" && Notification.permission !== "denied") {
-                        Notification.requestPermission();
-                    }
-                },
+                // YENİ: Bütün brauzerlərdə tam düzgün işləyən Bildiriş Sistemi
                 notifyUser(message) {
-                    if ("Notification" in window && Notification.permission === "granted") {
+                    if (!("Notification" in window)) return;
+                    
+                    if (Notification.permission === "granted") {
                         new Notification("ArxivGo", { body: message });
+                    } else if (Notification.permission !== "denied") {
+                        Notification.requestPermission().then(permission => {
+                            if (permission === "granted") {
+                                new Notification("ArxivGo", { body: message });
+                            }
+                        });
                     }
                 },
 
@@ -1087,20 +1127,21 @@ const uiHTML = `
 
                 async saveTextContent() {
                     if (!this.noteContent) return;
-                    
-                    const payload = { 
-                        id: this.editTextId, 
-                        content: this.noteContent 
-                    };
+                    const payload = { id: this.editTextId, content: this.noteContent };
 
-                    await fetch('/api/update-content', {
+                    const res = await fetch('/api/update-content', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify(payload)
                     });
+                    const data = await res.json();
 
-                    // YENİ: Bildiriş
-                    this.notifyUser("Mətn faylı redaktə edildi: " + this.noteTitle);
+                    // Backenddən gələn cavaba əsasən düzgün bildiriş
+                    if (data.versioned) {
+                        this.notifyUser("Fayl redaktə edildi və YENİ VERSİYA yaradıldı: " + data.fileName);
+                    } else {
+                        this.notifyUser("Mətn faylı uğurla redaktə edildi: " + data.fileName);
+                    }
 
                     this.activeModal = null;
                     this.editTextId = null;
@@ -1110,7 +1151,6 @@ const uiHTML = `
 
                 startEdit(file) {
                     this.editingFile = JSON.parse(JSON.stringify(file));
-                    this.oldFolderState = file.vFolder; // Dəyişikliyi yoxlamaq üçün
                     this.$nextTick(() => lucide.createIcons());
                 },
                 addTag() {
@@ -1120,14 +1160,16 @@ const uiHTML = `
                     }
                 },
                 removeTag(tag) { this.editingFile.tags = this.editingFile.tags.filter(t => t !== tag); },
+                
                 async saveEdit() {
-                    await fetch('/api/update', { method: 'POST', body: JSON.stringify(this.editingFile) });
+                    const res = await fetch('/api/update', { method: 'POST', body: JSON.stringify(this.editingFile) });
+                    const data = await res.json();
                     
-                    // YENİ: Bildiriş məntiqi. Qovluq dəyişibsə "Köçürüldü" mesajı
-                    if (this.oldFolderState !== this.editingFile.vFolder) {
-                        this.notifyUser("Fayl köçürüldü: " + this.editingFile.name);
+                    // Backenddən gələn cavaba əsasən bildiriş
+                    if (data.moved) {
+                        this.notifyUser("Fayl başqa qovluğa köçürüldü: " + data.fileName);
                     } else {
-                        this.notifyUser("Fayl məlumatları yeniləndi: " + this.editingFile.name);
+                        this.notifyUser("Fayl məlumatları yeniləndi: " + data.fileName);
                     }
 
                     this.editingFile = null;
@@ -1166,10 +1208,14 @@ const uiHTML = `
                     formData.append('tags', JSON.stringify(this.uploadTags));
                     formData.append('vFolder', this.uploadVFolder);
 
-                    await fetch('/api/upload', { method: 'POST', body: formData });
+                    const res = await fetch('/api/upload', { method: 'POST', body: formData });
+                    const data = await res.json();
                     
-                    // YENİ: Bildiriş
-                    this.notifyUser("Yeni fayl əlavə edildi: " + this.uploadingFile.name);
+                    if (data.versioned) {
+                        this.notifyUser("Bu fayl mövcud idi, YENİ VERSİYASI əlavə edildi: " + data.fileName);
+                    } else {
+                        this.notifyUser("Yeni fayl sistemə əlavə edildi: " + data.fileName);
+                    }
 
                     this.uploadingFile = null;
                     this.fetchMeta();
@@ -1186,14 +1232,18 @@ const uiHTML = `
                         vFolder: this.uploadVFolder
                     };
 
-                    await fetch('/api/create-note', {
+                    const res = await fetch('/api/create-note', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify(payload)
                     });
+                    const data = await res.json();
 
-                    // YENİ: Bildiriş
-                    this.notifyUser("Yeni qeyd yaradıldı: " + this.noteTitle);
+                    if (data.versioned) {
+                        this.notifyUser("Bu adda qeyd var idi, YENİ VERSİYASI yaradıldı: " + data.fileName);
+                    } else {
+                        this.notifyUser("Yeni qeyd yaradıldı: " + data.fileName);
+                    }
 
                     this.activeModal = null;
                     this.fetchMeta();
@@ -1220,7 +1270,6 @@ const uiHTML = `
                 }
             },
             mounted() {
-                this.requestNotifications(); // Veb səhifə açıldıqda bildiriş icazəsi istəyir
                 this.fetchMeta();
                 lucide.createIcons();
                 setInterval(this.fetchMeta, 5000);
@@ -1229,6 +1278,16 @@ const uiHTML = `
                 window.addEventListener('dragover', this.onDragOver);
                 window.addEventListener('dragleave', this.onDragLeave);
                 window.addEventListener('drop', this.onDrop);
+
+                // YENİ: Chrome, Edge, Firefox qorunmalarını keçmək üçün 
+                // səhifəyə ilk dəfə kliklənəndə bildiriş icazəsi istənir!
+                const requestPerm = () => {
+                    if ("Notification" in window && Notification.permission === "default") {
+                        Notification.requestPermission();
+                    }
+                    window.removeEventListener('click', requestPerm);
+                };
+                window.addEventListener('click', requestPerm);
             },
             beforeUnmount() {
                 window.removeEventListener('dragenter', this.onDragEnter);
