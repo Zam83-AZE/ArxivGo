@@ -52,8 +52,15 @@ type NoteRequest struct {
 	VFolder string   `json:"vFolder"`
 }
 
+// YENİ: Mətn fayllarını birbaşa serverdə yeniləmək üçün model
+type UpdateContentRequest struct {
+	ID      string `json:"id"`
+	Content string `json:"content"`
+}
+
 const dbPath = "data.json"
 const storageFolder = "ArxivGo_Storage"
+
 var state AppState
 
 // --- BACKEND MƏNTİQİ ---
@@ -93,7 +100,7 @@ func performScan(pathsToScan []string) {
 	state.mu.RLock()
 	existingPaths := make(map[string]bool, len(state.Files))
 	for _, f := range state.Files {
-		existingPaths[f.Path] = true 
+		existingPaths[f.Path] = true
 	}
 	state.mu.RUnlock()
 
@@ -101,8 +108,10 @@ func performScan(pathsToScan []string) {
 
 	for _, dir := range pathsToScan {
 		filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-			if err != nil { return nil }
-			
+			if err != nil {
+				return nil
+			}
+
 			if d.IsDir() {
 				name := d.Name()
 				if name == ".git" || name == "node_modules" || name == "Windows" || name == "AppData" || name == "sys" {
@@ -132,7 +141,7 @@ func performScan(pathsToScan []string) {
 		state.mu.Lock()
 		state.Files = append(state.Files, newFiles...)
 		state.mu.Unlock()
-		
+
 		go saveDB()
 		fmt.Printf("✅ Skan bitdi: %d yeni fayl tapıldı!\n", len(newFiles))
 	}
@@ -165,16 +174,18 @@ func autoStartupScan() {
 func searchHandler(w http.ResponseWriter, r *http.Request) {
 	query := strings.ToLower(r.URL.Query().Get("q"))
 	folderFilter := r.URL.Query().Get("folder")
-	
+
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	if limit <= 0 { limit = 50 } 
-	
+	if limit <= 0 {
+		limit = 50
+	}
+
 	var tagMatches []FileData
 	var nameMatches []FileData
-	
+
 	targetCount := offset + limit
-	
+
 	state.mu.RLock()
 	defer state.mu.RUnlock()
 
@@ -187,7 +198,9 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 			if len(nameMatches) < targetCount {
 				nameMatches = append(nameMatches, f)
 			}
-			if len(nameMatches) >= targetCount { break }
+			if len(nameMatches) >= targetCount {
+				break
+			}
 			continue
 		}
 
@@ -295,16 +308,22 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	state.mu.Unlock()
-	go saveDB() 
+	go saveDB()
 	w.WriteHeader(http.StatusOK)
 }
 
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	err := r.ParseMultipartForm(500 << 20)
-	if err != nil { http.Error(w, err.Error(), 400); return }
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
 
 	file, handler, err := r.FormFile("file")
-	if err != nil { http.Error(w, err.Error(), 400); return }
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
 	defer file.Close()
 
 	tagsJSON := r.FormValue("tags")
@@ -312,7 +331,10 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	destPath := filepath.Join(storageFolder, handler.Filename)
 	destFile, err := os.Create(destPath)
-	if err != nil { http.Error(w, err.Error(), 500); return }
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
 	defer destFile.Close()
 
 	io.Copy(destFile, file)
@@ -323,7 +345,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	absPath, _ := filepath.Abs(destPath)
-	
+
 	hash := md5.Sum([]byte(absPath))
 	uniqueID := hex.EncodeToString(hash[:])
 
@@ -354,8 +376,10 @@ func createNoteHandler(w http.ResponseWriter, r *http.Request) {
 	safeTitle := strings.ReplaceAll(req.Title, " ", "_")
 	safeTitle = strings.ReplaceAll(safeTitle, "/", "-")
 	safeTitle = strings.ReplaceAll(safeTitle, "\\", "-")
-	if safeTitle == "" { safeTitle = "Adsiz_Qeyd" }
-	
+	if safeTitle == "" {
+		safeTitle = "Adsiz_Qeyd"
+	}
+
 	fileName := safeTitle + ".txt"
 	destPath := filepath.Join(storageFolder, fileName)
 
@@ -393,13 +417,13 @@ func createNoteHandler(w http.ResponseWriter, r *http.Request) {
 
 func scanHandler(w http.ResponseWriter, r *http.Request) {
 	dir := r.URL.Query().Get("path")
-	if dir != "" { 
-		go performScan([]string{dir}) 
+	if dir != "" {
+		go performScan([]string{dir})
 	}
 	fmt.Fprint(w, "Scan initiated")
 }
 
-// 1. LOKAL AÇILIŞ (Serverin özündə işləyəndə OS-də açır)
+// 1. LOKAL AÇILIŞ
 func openFileHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	state.mu.Lock()
@@ -417,13 +441,13 @@ func openFileHandler(w http.ResponseWriter, r *http.Request) {
 
 	if targetPath != "" {
 		switch runtime.GOOS {
-		case "windows": 
+		case "windows":
 			exec.Command("cmd", "/C", "start", "", targetPath).Start()
 			fmt.Fprint(w, "Opened on Windows")
-		case "darwin":  
+		case "darwin":
 			exec.Command("open", targetPath).Start()
 			fmt.Fprint(w, "Opened on Mac")
-		default:        
+		default:
 			exec.Command("xdg-open", targetPath).Start()
 			fmt.Fprint(w, "Opened on Linux")
 		}
@@ -432,7 +456,7 @@ func openFileHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// 2. ŞƏBƏKƏ/KƏNAR AÇILIŞ (Müştəri başqa cihazdadırsa brauzerə xidmət edir/yükləyir)
+// 2. ŞƏBƏKƏ/KƏNAR AÇILIŞ (Download və View)
 func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	state.mu.Lock()
@@ -451,23 +475,72 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	go saveDB()
 
 	if targetPath != "" {
-		// MÜHÜM YENİLİK: Faylın uzantısını tapırıq
 		ext := strings.ToLower(filepath.Ext(fileName))
-		
-		// Əgər fayl brauzerdə oxuna biləndirsə (şəkil, pdf, video, mətn), inline edirik (yeni tabda açılır)
 		if ext == ".pdf" || ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".txt" || ext == ".mp4" || ext == ".webp" {
 			w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=\"%s\"", fileName))
 		} else {
-			// .docx, .xlsx, .zip və s. kimi fayllar məcburi olaraq öz əsl adları ilə yüklənir
 			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", fileName))
 		}
-
 		http.ServeFile(w, r, targetPath)
 	} else {
 		http.Error(w, "Fayl tapılmadı", http.StatusNotFound)
 	}
 }
 
+// YENİ: Veb redaktor üçün faylın məzmununu gətirir
+func getFileContentHandler(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	state.mu.RLock()
+	var targetPath string
+	for _, f := range state.Files {
+		if f.ID == id {
+			targetPath = f.Path
+			break
+		}
+	}
+	state.mu.RUnlock()
+
+	if targetPath != "" {
+		content, err := os.ReadFile(targetPath)
+		if err == nil {
+			w.Write(content)
+			return
+		}
+	}
+	http.Error(w, "Fayl tapılmadı və ya oxunmadı", http.StatusNotFound)
+}
+
+// YENİ: Veb redaktorda edilən dəyişiklikləri orijinal faylın üzərinə yazır
+func updateFileContentHandler(w http.ResponseWriter, r *http.Request) {
+	var req UpdateContentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	state.mu.Lock()
+	var targetPath string
+	for i, f := range state.Files {
+		if f.ID == req.ID {
+			state.Files[i].LastAccessed = time.Now()
+			targetPath = f.Path
+			break
+		}
+	}
+	state.mu.Unlock()
+
+	if targetPath != "" {
+		err := os.WriteFile(targetPath, []byte(req.Content), 0644)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		go saveDB()
+		w.WriteHeader(http.StatusOK)
+	} else {
+		http.Error(w, "Fayl tapılmadı", http.StatusNotFound)
+	}
+}
 
 // --- MAIN ---
 
@@ -476,14 +549,18 @@ func main() {
 	loadDB()
 	go autoStartupScan()
 
-	http.HandleFunc("/api/search", searchHandler) 
-	http.HandleFunc("/api/meta", metaHandler)     
+	http.HandleFunc("/api/search", searchHandler)
+	http.HandleFunc("/api/meta", metaHandler)
 	http.HandleFunc("/api/update", updateHandler)
 	http.HandleFunc("/api/upload", uploadHandler)
 	http.HandleFunc("/api/create-note", createNoteHandler)
 	http.HandleFunc("/api/scan", scanHandler)
 	http.HandleFunc("/api/open", openFileHandler)
-	http.HandleFunc("/api/download", downloadHandler) // YENİ: Başqa cihazdan açmaq üçün
+	http.HandleFunc("/api/download", downloadHandler)
+
+	// YENİ: Redaktor API-ləri
+	http.HandleFunc("/api/get-content", getFileContentHandler)
+	http.HandleFunc("/api/update-content", updateFileContentHandler)
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
@@ -497,9 +574,9 @@ func main() {
 	for {
 		listener, err = net.Listen("tcp", fmt.Sprintf(":%d", port))
 		if err == nil {
-			break 
+			break
 		}
-		port++ 
+		port++
 	}
 
 	fmt.Printf("🚀 Server %d portunda hazırdır. UI: http://localhost:%d\n", port, port)
@@ -556,7 +633,7 @@ const uiHTML = `
                          style="max-height: 45vh; overflow-y: auto;">
                         
                         <div v-for="f in searchResults" :key="f.id" class="px-6 py-4 hover:bg-blue-50/50 flex justify-between items-center group cursor-pointer border-b border-slate-50 last:border-0 shrink-0">
-                            <div @click="openFile(f.id)" class="flex-1 flex items-center gap-4">
+                            <div @click="openFile(f)" class="flex-1 flex items-center gap-4">
                                 <i data-lucide="file" class="w-5 h-5 text-slate-300"></i>
                                 <div>
                                     <div class="text-sm font-medium">{{ f.name }}</div>
@@ -656,6 +733,32 @@ const uiHTML = `
             </div>
         </div>
 
+        <div v-if="activeModal === 'edit-text'" class="fixed inset-0 modal-overlay flex items-center justify-center p-6 z-[1000]">
+            <div class="w-full max-w-4xl bg-white rounded-[40px] shadow-2xl border border-slate-100 p-10 flex flex-col h-[90vh]">
+                <div class="flex justify-between items-center mb-6">
+                    <h2 class="text-2xl font-bold flex items-center gap-2 text-blue-600"><i data-lucide="file-edit"></i> Mətn Redaktoru</h2>
+                    <button @click="activeModal = null" class="p-2 hover:bg-slate-100 rounded-full transition"><i data-lucide="x"></i></button>
+                </div>
+
+                <div class="mb-4">
+                    <label class="text-[10px] font-bold text-slate-400 uppercase block mb-2">Faylın Adı (Yalnız Oxumaq Üçün)</label>
+                    <input disabled v-model="noteTitle" type="text" class="w-full p-4 bg-slate-100 text-slate-500 rounded-2xl border-none outline-none cursor-not-allowed font-medium">
+                </div>
+
+                <div class="flex-1 flex flex-col min-h-0 mb-6">
+                    <label class="text-[10px] font-bold text-slate-400 uppercase block mb-2">Məzmun (Dəyişdirə Bilərsiniz)</label>
+                    <textarea v-model="noteContent" class="flex-1 w-full p-6 bg-slate-50 rounded-2xl border border-slate-200 outline-none focus:ring-2 ring-blue-200 resize-none font-mono text-sm custom-scroll leading-relaxed text-slate-700"></textarea>
+                </div>
+
+                <div class="flex gap-3 mt-auto">
+                    <button @click="saveTextContent" class="flex-1 bg-blue-600 text-white py-4 rounded-2xl font-bold hover:bg-blue-700 transition shadow-lg shadow-blue-200">
+                        Dəyişikliyi Fayla Yaz (Save)
+                    </button>
+                    <button @click="activeModal = null" class="px-10 py-4 bg-slate-100 text-slate-500 rounded-2xl font-bold hover:bg-slate-200 transition">Ləğv Et</button>
+                </div>
+            </div>
+        </div>
+
         <div v-if="(activeModal === 'folders' || activeModal === 'recents') && !editingFile && !uploadingFile" class="fixed inset-0 modal-overlay flex items-center justify-center p-6">
             <div class="w-full max-w-xl bg-white rounded-[40px] shadow-2xl border border-slate-100 p-10 flex flex-col max-h-[80vh]">
                 <div class="flex justify-between items-center mb-8">
@@ -670,7 +773,7 @@ const uiHTML = `
                         </div>
                     </div>
                     <div v-if="activeModal === 'recents'" class="space-y-3">
-                        <div v-for="f in recents" @click="openFile(f.id)" class="p-4 bg-slate-50 rounded-2xl flex justify-between items-center cursor-pointer hover:bg-blue-50 transition">
+                        <div v-for="f in recents" @click="openFile(f)" class="p-4 bg-slate-50 rounded-2xl flex justify-between items-center cursor-pointer hover:bg-blue-50 transition">
                             <span class="text-sm font-medium truncate w-64">{{ f.name }}</span>
                             <span class="text-[10px] text-slate-400 font-bold uppercase">{{ formatDate(f.createdAt) }}</span>
                         </div>
@@ -679,7 +782,7 @@ const uiHTML = `
             </div>
         </div>
 
-        <div v-if="editingFile" class="fixed inset-0 modal-overlay flex items-center justify-center p-6">
+        <div v-if="editingFile" class="fixed inset-0 modal-overlay flex items-center justify-center p-6 z-[1000]">
             <div class="w-full max-w-md bg-white rounded-[40px] shadow-2xl border border-slate-100 p-10">
                 <h3 class="text-xl font-bold mb-2 truncate">{{ editingFile.name }}</h3>
                 <p class="text-[10px] text-slate-400 uppercase tracking-widest mb-8">Fayl Redaktəsi</p>
@@ -728,8 +831,10 @@ const uiHTML = `
                     uploadVFolder: '',
                     searchTimeout: null,
                     isSearching: false,
+                    
                     noteTitle: '',
                     noteContent: '',
+                    editTextId: null, // YENİ: Redaktə edilən faylın ID-si
                     
                     offset: 0,
                     limit: 50,
@@ -812,21 +917,60 @@ const uiHTML = `
                         }
                     }
                 },
-                // YENİ: HİBRİD AÇILIŞ MƏNTİQİ
-                async openFile(id) {
+
+                // YENİ: Tam təkmilləşdirilmiş Hibrid Açılış Məntiqi
+                async openFile(f) {
                     const host = window.location.hostname;
-                    // Əgər kompyuterin özündəyiksə (localhost)
                     const isLocal = (host === 'localhost' || host === '127.0.0.1' || host === '[::1]');
                     
+                    // Faylın uzantısını tapırıq
+                    const ext = f.name.slice((f.name.lastIndexOf(".") - 1 >>> 0) + 2).toLowerCase();
+                    const isTextFile = ['txt', 'md', 'json', 'csv', 'log', 'html', 'css', 'js'].includes(ext);
+
+                    // Əgər şəbəkədən girilibsə VƏ fayl mətn tiplidirsə -> Veb Redaktoru aç
+                    if (!isLocal && isTextFile) {
+                        const res = await fetch('/api/get-content?id=' + f.id);
+                        if (res.ok) {
+                            const content = await res.text();
+                            this.editTextId = f.id;
+                            this.noteTitle = f.name;
+                            this.noteContent = content;
+                            this.openModal('edit-text');
+                            return; // Burda dayanırıq ki, faylı kompyuterə yükləməsin
+                        }
+                    }
+
+                    // Əks halda köhnə qayda ilə işləyir
                     if (isLocal) {
-                        // Səssizcə OS-də açır (Köhnə və sevimli qayda)
-                        await fetch('/api/open?id=' + id);
+                        await fetch('/api/open?id=' + f.id);
                     } else {
-                        // Əgər telefondan/başqa PC-dən daxil olmuşuqsa, brauzerdə aç və ya yüklə
-                        window.open('/api/download?id=' + id, '_blank');
+                        window.open('/api/download?id=' + f.id, '_blank');
                     }
                     setTimeout(() => this.fetchMeta(), 1000);
                 },
+
+                // YENİ: Veb redaktordakı yazıları serverə göndərib yadda saxlayır
+                async saveTextContent() {
+                    if (!this.noteContent) return;
+                    
+                    const payload = { 
+                        id: this.editTextId, 
+                        content: this.noteContent 
+                    };
+
+                    await fetch('/api/update-content', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    this.activeModal = null;
+                    this.editTextId = null;
+                    this.noteContent = '';
+                    this.fetchMeta();
+                    // Kiçik bir xəbərdarlıq çıxara bilərik, ya da sadəcə səssiz bağlaya bilərik (hazırda səssiz bağlanır)
+                },
+
                 startEdit(file) {
                     this.editingFile = JSON.parse(JSON.stringify(file));
                     this.$nextTick(() => lucide.createIcons());
@@ -905,6 +1049,7 @@ const uiHTML = `
                 },
                 openModal(type) {
                     this.activeModal = type;
+                    // Reset fields if it's note or upload
                     if (type === 'note' || type === 'upload') {
                         this.uploadTags = [];
                         this.uploadVFolder = '';
