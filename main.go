@@ -67,7 +67,6 @@ type APIResponse struct {
 
 const dbPath = "data.json"
 const storageFolder = "ArxivGo_Storage"
-
 var state AppState
 
 // --- SSE (CANLI BİLDİRİŞ) SİSTEMİ ---
@@ -192,9 +191,7 @@ func performScan(pathsToScan []string) {
 
 	for _, dir := range pathsToScan {
 		filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return nil
-			}
+			if err != nil { return nil }
 			if d.IsDir() {
 				name := d.Name()
 				if name == ".git" || name == "node_modules" || name == "Windows" || name == "AppData" || name == "sys" {
@@ -255,18 +252,16 @@ func autoStartupScan() {
 func searchHandler(w http.ResponseWriter, r *http.Request) {
 	query := strings.ToLower(r.URL.Query().Get("q"))
 	folderFilter := r.URL.Query().Get("folder")
-
+	
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	if limit <= 0 {
-		limit = 50
-	}
-
+	if limit <= 0 { limit = 50 } 
+	
 	var tagMatches []FileData
 	var nameMatches []FileData
-
+	
 	targetCount := offset + limit
-
+	
 	state.mu.RLock()
 	defer state.mu.RUnlock()
 
@@ -278,9 +273,7 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 			if len(nameMatches) < targetCount {
 				nameMatches = append(nameMatches, f)
 			}
-			if len(nameMatches) >= targetCount {
-				break
-			}
+			if len(nameMatches) >= targetCount { break }
 			continue
 		}
 
@@ -387,18 +380,18 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 	for i, f := range state.Files {
 		if f.ID == updated.ID {
 			state.Files[i].Tags = updated.Tags
-
+			
 			if f.VFolder != updated.VFolder {
 				oldPath := f.Path
-
+				
 				newDir := storageFolder
 				if updated.VFolder != "" {
 					newDir = filepath.Join(storageFolder, filepath.FromSlash(updated.VFolder))
 				}
-				os.MkdirAll(newDir, 0755)
-
+				os.MkdirAll(newDir, 0755) 
+				
 				newPath := filepath.Join(newDir, filepath.Base(oldPath))
-
+				
 				if oldPath != newPath {
 					err := os.Rename(oldPath, newPath)
 					if err != nil {
@@ -417,16 +410,15 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
-
+			
 			state.Files[i].VFolder = updated.VFolder
 			finalName = state.Files[i].Name
 			break
 		}
 	}
 	state.mu.Unlock()
-	go saveDB()
+	go saveDB() 
 
-	// SSE Məlumat Yayımı
 	if isMoved {
 		go broadcastEvent("Fayl başqa qovluğa köçürüldü: " + finalName)
 	} else {
@@ -436,22 +428,24 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 	sendJSON(w, APIResponse{Success: true, Moved: isMoved, FileName: finalName})
 }
 
+// YENİ: Çoxlu fayl yükləməsini dəstəkləyən handler
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	err := r.ParseMultipartForm(500 << 20)
-	if err != nil {
-		http.Error(w, err.Error(), 400)
-		return
-	}
+	if err != nil { http.Error(w, err.Error(), 400); return }
 
-	file, handler, err := r.FormFile("file")
-	if err != nil {
-		http.Error(w, err.Error(), 400)
+	files := r.MultipartForm.File["files"]
+	if len(files) == 0 {
+		http.Error(w, "Fayl tapılmadı", 400)
 		return
 	}
-	defer file.Close()
 
 	tagsJSON := r.FormValue("tags")
 	vFolder := r.FormValue("vFolder")
+
+	var tags []string
+	if tagsJSON != "" {
+		json.Unmarshal([]byte(tagsJSON), &tags)
+	}
 
 	destDir := storageFolder
 	if vFolder != "" {
@@ -459,70 +453,78 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		os.MkdirAll(destDir, 0755)
 	}
 
-	finalName := handler.Filename
-	destPath := filepath.Join(destDir, finalName)
+	var uploadedNames []string
 
-	isVersioned := false
-	info, err := os.Stat(destPath)
-	if err == nil {
-		if info.Size() != handler.Size {
-			finalName, destPath = getNextVersion(destDir, handler.Filename)
-			isVersioned = true
+	for _, fileHeader := range files {
+		file, err := fileHeader.Open()
+		if err != nil { continue }
+
+		finalName := fileHeader.Filename
+		destPath := filepath.Join(destDir, finalName)
+
+		isVersioned := false
+		info, err := os.Stat(destPath)
+		if err == nil {
+			if info.Size() != fileHeader.Size {
+				finalName, destPath = getNextVersion(destDir, fileHeader.Filename)
+				isVersioned = true
+			}
+		}
+
+		destFile, err := os.Create(destPath)
+		if err != nil {
+			file.Close()
+			continue
+		}
+
+		io.Copy(destFile, file)
+		destFile.Close()
+		file.Close()
+
+		absPath, _ := filepath.Abs(destPath)
+		hash := md5.Sum([]byte(absPath))
+		uniqueID := hex.EncodeToString(hash[:])
+
+		state.mu.Lock()
+		existsInDB := false
+		for i, f := range state.Files {
+			if f.Path == absPath {
+				state.Files[i].Tags = tags
+				state.Files[i].VFolder = vFolder
+				state.Files[i].CreatedAt = time.Now()
+				existsInDB = true
+				break
+			}
+		}
+
+		if !existsInDB {
+			newFile := FileData{
+				ID:        uniqueID,
+				Name:      finalName,
+				Path:      absPath,
+				VFolder:   vFolder,
+				Tags:      tags,
+				CreatedAt: time.Now(),
+			}
+			state.Files = append(state.Files, newFile)
+		}
+		state.mu.Unlock()
+
+		uploadedNames = append(uploadedNames, finalName)
+
+		if isVersioned {
+			go broadcastEvent("YENİ VERSİYA əlavə edildi: " + finalName)
+		} else {
+			go broadcastEvent("Yeni fayl sistemə əlavə edildi: " + finalName)
 		}
 	}
 
-	destFile, err := os.Create(destPath)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	defer destFile.Close()
-
-	io.Copy(destFile, file)
-
-	var tags []string
-	if tagsJSON != "" {
-		json.Unmarshal([]byte(tagsJSON), &tags)
-	}
-
-	absPath, _ := filepath.Abs(destPath)
-	hash := md5.Sum([]byte(absPath))
-	uniqueID := hex.EncodeToString(hash[:])
-
-	state.mu.Lock()
-	existsInDB := false
-	for i, f := range state.Files {
-		if f.Path == absPath {
-			state.Files[i].Tags = tags
-			state.Files[i].VFolder = vFolder
-			state.Files[i].CreatedAt = time.Now()
-			existsInDB = true
-			break
-		}
-	}
-
-	if !existsInDB {
-		newFile := FileData{
-			ID:        uniqueID,
-			Name:      finalName,
-			Path:      absPath,
-			VFolder:   vFolder,
-			Tags:      tags,
-			CreatedAt: time.Now(),
-		}
-		state.Files = append(state.Files, newFile)
-	}
-	state.mu.Unlock()
 	go saveDB()
 
-	// SSE Məlumat Yayımı
-	if isVersioned {
-		go broadcastEvent("Bu fayl mövcud idi, YENİ VERSİYASI əlavə edildi: " + finalName)
-	} else {
-		go broadcastEvent("Yeni fayl sistemə əlavə edildi: " + finalName)
-	}
-
-	sendJSON(w, APIResponse{Success: true, Versioned: isVersioned, FileName: finalName})
+	sendJSON(w, APIResponse{
+		Success: true, 
+		Message: fmt.Sprintf("%d fayl uğurla yükləndi", len(uploadedNames)),
+	})
 }
 
 func createNoteHandler(w http.ResponseWriter, r *http.Request) {
@@ -535,17 +537,15 @@ func createNoteHandler(w http.ResponseWriter, r *http.Request) {
 	safeTitle := strings.ReplaceAll(req.Title, " ", "_")
 	safeTitle = strings.ReplaceAll(safeTitle, "/", "-")
 	safeTitle = strings.ReplaceAll(safeTitle, "\\", "-")
-	if safeTitle == "" {
-		safeTitle = "Adsiz_Qeyd"
-	}
-
+	if safeTitle == "" { safeTitle = "Adsiz_Qeyd" }
+	
 	fileName := safeTitle + ".txt"
 	destDir := storageFolder
 	if req.VFolder != "" {
 		destDir = filepath.Join(storageFolder, filepath.FromSlash(req.VFolder))
 		os.MkdirAll(destDir, 0755)
 	}
-
+	
 	destPath := filepath.Join(destDir, fileName)
 
 	isVersioned := false
@@ -578,7 +578,6 @@ func createNoteHandler(w http.ResponseWriter, r *http.Request) {
 	state.mu.Unlock()
 	go saveDB()
 
-	// SSE Məlumat Yayımı
 	if isVersioned {
 		go broadcastEvent("Bu adda qeyd var idi, YENİ VERSİYASI yaradıldı: " + fileName)
 	} else {
@@ -590,8 +589,8 @@ func createNoteHandler(w http.ResponseWriter, r *http.Request) {
 
 func scanHandler(w http.ResponseWriter, r *http.Request) {
 	dir := r.URL.Query().Get("path")
-	if dir != "" {
-		go performScan([]string{dir})
+	if dir != "" { 
+		go performScan([]string{dir}) 
 	}
 	fmt.Fprint(w, "Scan initiated")
 }
@@ -613,13 +612,13 @@ func openFileHandler(w http.ResponseWriter, r *http.Request) {
 
 	if targetPath != "" {
 		switch runtime.GOOS {
-		case "windows":
+		case "windows": 
 			exec.Command("cmd", "/C", "start", "", targetPath).Start()
 			fmt.Fprint(w, "Opened on Windows")
-		case "darwin":
+		case "darwin":  
 			exec.Command("open", targetPath).Start()
 			fmt.Fprint(w, "Opened on Mac")
-		default:
+		default:        
 			exec.Command("xdg-open", targetPath).Start()
 			fmt.Fprint(w, "Opened on Linux")
 		}
@@ -749,13 +748,12 @@ func updateFileContentHandler(w http.ResponseWriter, r *http.Request) {
 		state.Files = append(state.Files, newFile)
 	} else {
 		state.Files[fileIndex].LastAccessed = time.Now()
-		state.Files[fileIndex].CreatedAt = time.Now()
+		state.Files[fileIndex].CreatedAt = time.Now() 
 	}
 	state.mu.Unlock()
 
-	go saveDB()
+	go saveDB() 
 
-	// SSE Məlumat Yayımı
 	if isVersioned {
 		go broadcastEvent("Fayl redaktə edildi və YENİ VERSİYA yaradıldı: " + finalName)
 	} else {
@@ -770,19 +768,18 @@ func main() {
 	loadDB()
 	go autoStartupScan()
 
-	http.HandleFunc("/api/search", searchHandler)
-	http.HandleFunc("/api/meta", metaHandler)
+	http.HandleFunc("/api/search", searchHandler) 
+	http.HandleFunc("/api/meta", metaHandler)     
 	http.HandleFunc("/api/update", updateHandler)
 	http.HandleFunc("/api/upload", uploadHandler)
 	http.HandleFunc("/api/create-note", createNoteHandler)
 	http.HandleFunc("/api/scan", scanHandler)
 	http.HandleFunc("/api/open", openFileHandler)
-	http.HandleFunc("/api/download", downloadHandler)
-
+	http.HandleFunc("/api/download", downloadHandler) 
+	
 	http.HandleFunc("/api/get-content", getFileContentHandler)
 	http.HandleFunc("/api/update-content", updateFileContentHandler)
-
-	// YENİ: Bütün canlı hadisələri dinləmək üçün endpoint
+	
 	http.HandleFunc("/api/events", eventsHandler)
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -797,9 +794,9 @@ func main() {
 	for {
 		listener, err = net.Listen("tcp", fmt.Sprintf(":%d", port))
 		if err == nil {
-			break
+			break 
 		}
-		port++
+		port++ 
 	}
 
 	fmt.Printf("🚀 Server %d portunda hazırdır. UI: http://localhost:%d\n", port, port)
@@ -851,12 +848,12 @@ const uiHTML = `
         <div :class="dragActive ? 'drop-zone-active' : 'drop-zone-inactive'" 
              class="fixed inset-0 bg-blue-50/90 border-[6px] border-dashed border-blue-400 flex items-center justify-center transition-opacity duration-200">
             <div class="text-3xl font-bold text-blue-600 bg-white px-10 py-6 rounded-3xl shadow-2xl flex items-center gap-4">
-                <i data-lucide="upload-cloud" class="w-12 h-12"></i> Faylı buraya buraxın
+                <i data-lucide="upload-cloud" class="w-12 h-12"></i> Faylları buraya buraxın
             </div>
         </div>
 
         <div class="w-full max-w-2xl px-6 relative z-10 flex flex-col">
-            <div v-if="!activeModal && !editingFile && !uploadingFile" class="text-center w-full">
+            <div v-if="!activeModal && !editingFile && uploadingFiles.length === 0" class="text-center w-full">
                 <h1 class="text-5xl font-light mb-1 select-none">Arxiv<span class="font-bold text-blue-600">Go</span></h1>
                 <p class="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-10">Cəmi Fayl: {{ totalFiles }}</p>
 
@@ -869,7 +866,7 @@ const uiHTML = `
                 <div class="relative w-full mb-8">
                     <div class="search-container flex items-center bg-white border border-slate-200 rounded-full px-6 py-4 transition-all shadow-sm relative z-20">
                         <i data-lucide="search" class="w-5 h-5 text-slate-400 mr-4"></i>
-                        <input v-model="query" @input="onSearchInput" type="text" placeholder="Axtar və ya faylı ekrana at..." class="flex-1 outline-none text-lg bg-transparent">
+                        <input v-model="query" @input="onSearchInput" type="text" placeholder="Axtar və ya faylları ekrana at..." class="flex-1 outline-none text-lg bg-transparent">
                         <div v-if="isSearching" class="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
                     </div>
 
@@ -906,13 +903,19 @@ const uiHTML = `
             </div>
         </div>
 
-        <div v-if="uploadingFile" class="fixed inset-0 modal-overlay flex items-center justify-center p-6 z-[1000]">
-            <div class="w-full max-w-md bg-white rounded-[40px] shadow-2xl border border-slate-100 p-10">
+        <div v-if="uploadingFiles.length > 0" class="fixed inset-0 modal-overlay flex items-center justify-center p-6 z-[1000]">
+            <div class="w-full max-w-md bg-white rounded-[40px] shadow-2xl border border-slate-100 p-10 flex flex-col max-h-[90vh]">
                 <div class="flex items-center gap-3 text-blue-600 mb-2">
-                    <i data-lucide="file-plus" class="w-6 h-6 flex-shrink-0"></i>
-                    <h3 class="text-xl font-bold break-words">{{ uploadingFile.name }}</h3>
+                    <i data-lucide="copy-plus" class="w-6 h-6 flex-shrink-0"></i>
+                    <h3 class="text-xl font-bold break-words">{{ uploadingFiles.length }} fayl seçildi</h3>
                 </div>
-                <p class="text-[10px] text-slate-400 uppercase tracking-widest mb-8">Yeni Fayl Əlavə Olunur</p>
+                <p class="text-[10px] text-slate-400 uppercase tracking-widest mb-4">Yeni Fayllar Əlavə Olunur</p>
+
+                <div class="max-h-24 overflow-y-auto mb-6 bg-slate-50 p-3 rounded-xl custom-scroll border border-slate-100">
+                    <div v-for="f in uploadingFiles" class="text-[11px] text-slate-500 mb-1 border-b border-slate-200/60 last:border-0 pb-1 flex items-center gap-2 break-all">
+                        <i data-lucide="file" class="w-3 h-3 text-slate-400 flex-shrink-0"></i> {{ f.name }}
+                    </div>
+                </div>
 
                 <div class="mb-6">
                     <label class="text-[10px] font-bold text-slate-400 uppercase block mb-2">Teqlər əlavə et (Enter)</label>
@@ -930,9 +933,9 @@ const uiHTML = `
                     <input v-model="uploadVFolder" placeholder="Məsələn: Sənədlər/Hesabatlar..." class="w-full p-4 bg-slate-50 rounded-2xl border-none outline-none focus:ring-2 ring-blue-100">
                 </div>
 
-                <div class="flex gap-3">
+                <div class="flex gap-3 mt-auto">
                     <button @click="confirmUpload" class="flex-1 bg-blue-600 text-white py-4 rounded-2xl font-bold hover:bg-blue-700 transition">Sistemə Əlavə Et</button>
-                    <button @click="uploadingFile = null" class="px-8 py-4 bg-slate-100 text-slate-400 rounded-2xl font-bold hover:bg-slate-200 transition">Ləğv Et</button>
+                    <button @click="uploadingFiles = []" class="px-8 py-4 bg-slate-100 text-slate-400 rounded-2xl font-bold hover:bg-slate-200 transition">Ləğv Et</button>
                 </div>
             </div>
         </div>
@@ -1008,7 +1011,7 @@ const uiHTML = `
             </div>
         </div>
 
-        <div v-if="(activeModal === 'folders' || activeModal === 'recents') && !editingFile && !uploadingFile" class="fixed inset-0 modal-overlay flex items-center justify-center p-6 z-[1000]">
+        <div v-if="(activeModal === 'folders' || activeModal === 'recents') && !editingFile && uploadingFiles.length === 0" class="fixed inset-0 modal-overlay flex items-center justify-center p-6 z-[1000]">
             <div class="w-full max-w-xl bg-white rounded-[40px] shadow-2xl border border-slate-100 p-10 flex flex-col max-h-[80vh]">
                 <div class="flex justify-between items-center mb-8">
                     <h2 class="text-2xl font-bold capitalize">{{ activeModal === 'folders' ? 'Qovluqlar' : 'Son Əlavələr' }}</h2>
@@ -1079,7 +1082,7 @@ const uiHTML = `
                     editingFile: null, 
                     newTag: '',
                     dragActive: false, 
-                    uploadingFile: null, 
+                    uploadingFiles: [], // YENİ: Massivə çevrildi 
                     uploadTags: [], 
                     uploadVFolder: '',
                     searchTimeout: null,
@@ -1227,13 +1230,12 @@ const uiHTML = `
                     if (!this.noteContent) return;
                     const payload = { id: this.editTextId, content: this.noteContent };
 
-                    const res = await fetch('/api/update-content', {
+                    await fetch('/api/update-content', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify(payload)
                     });
                     
-                    // Bildirişi artıq Server göndərir
                     this.activeModal = null;
                     this.editTextId = null;
                     this.noteContent = '';
@@ -1268,8 +1270,9 @@ const uiHTML = `
                     e.preventDefault();
                     this.dragActive = false;
                     
+                    // YENİ: Çoxlu faylları qəbul edirik
                     if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-                        this.uploadingFile = e.dataTransfer.files[0];
+                        this.uploadingFiles = Array.from(e.dataTransfer.files);
                         this.uploadTags = [];
                         this.uploadVFolder = '';
                         this.$nextTick(() => lucide.createIcons());
@@ -1283,12 +1286,17 @@ const uiHTML = `
                 },
                 async confirmUpload() {
                     const formData = new FormData();
-                    formData.append('file', this.uploadingFile);
+                    
+                    // YENİ: Bütün faylları "files" açarı ilə formData-ya əlavə edirik
+                    this.uploadingFiles.forEach(file => {
+                        formData.append('files', file);
+                    });
+                    
                     formData.append('tags', JSON.stringify(this.uploadTags));
                     formData.append('vFolder', this.uploadVFolder);
 
                     await fetch('/api/upload', { method: 'POST', body: formData });
-                    this.uploadingFile = null;
+                    this.uploadingFiles = []; // Təmizləyirik
                 },
                 async saveNote() {
                     if (!this.noteTitle.trim() || !this.noteContent.trim()) {
@@ -1333,8 +1341,6 @@ const uiHTML = `
                 this.fetchMeta();
                 lucide.createIcons();
 
-                // YENİ: Server-Sent Events qoşulması
-                // Serverdən canli gələn hər bildirişi dinləyirik və məlumatı avtomatik yeniləyirik
                 const evtSource = new EventSource('/api/events');
                 evtSource.onmessage = (event) => {
                     this.notifyUser(event.data);
