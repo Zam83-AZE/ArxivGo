@@ -428,7 +428,6 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 	sendJSON(w, APIResponse{Success: true, Moved: isMoved, FileName: finalName})
 }
 
-// YENİ: Çoxlu fayl yükləməsini dəstəkləyən handler
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	err := r.ParseMultipartForm(500 << 20)
 	if err != nil { http.Error(w, err.Error(), 400); return }
@@ -872,8 +871,8 @@ const uiHTML = `
 
                     <div v-if="searchResults.length > 0" 
                          @scroll="handleScroll"
-                         class="absolute w-full left-0 mt-2 bg-white border border-slate-100 rounded-3xl shadow-2xl z-50 overflow-hidden text-left flex flex-col custom-scroll"
-                         style="max-height: 45vh; overflow-y: auto;">
+                         class="absolute w-full left-0 mt-2 bg-white border border-slate-100 rounded-3xl shadow-2xl z-50 text-left flex flex-col custom-scroll py-2"
+                         style="max-height: 40vh; overflow-y: auto;">
                         
                         <div v-for="f in searchResults" :key="f.id" class="px-6 py-4 hover:bg-blue-50/50 flex justify-between items-center group cursor-pointer border-b border-slate-50 last:border-0 shrink-0">
                             <div @click="openFile(f)" class="flex-1 flex items-center gap-4">
@@ -895,7 +894,7 @@ const uiHTML = `
                             <div class="w-3 h-3 border-2 border-slate-400 border-t-transparent rounded-full animate-spin"></div> Yüklənir...
                         </div>
                         
-                        <div v-if="!hasMore && searchResults.length > 0" class="py-3 text-center text-[10px] text-slate-300 uppercase tracking-widest font-bold bg-slate-50 border-t border-slate-100">
+                        <div v-if="!hasMore && searchResults.length > 0" class="py-3 text-center text-[10px] text-slate-300 uppercase tracking-widest font-bold bg-slate-50 border-t border-slate-100 mt-2 mx-2 rounded-2xl">
                             Siyahının sonu
                         </div>
                     </div>
@@ -1024,9 +1023,16 @@ const uiHTML = `
                             <div class="text-sm font-bold text-slate-700 break-words">{{ v || 'Adsız' }}</div>
                         </div>
                     </div>
+                    
                     <div v-if="activeModal === 'recents'" class="space-y-3">
                         <div v-for="f in recents" @click="openFile(f)" class="p-4 bg-slate-50 rounded-2xl flex justify-between items-center cursor-pointer hover:bg-blue-50 transition">
-                            <span class="text-sm font-medium break-words flex-1 pr-4">{{ f.name }}</span>
+                            <div class="flex-1 pr-4">
+                                <div class="text-sm font-medium break-words text-slate-700">{{ f.name }}</div>
+                                <div class="flex gap-2 mt-2 flex-wrap">
+                                    <span v-for="t in f.tags" class="text-[9px] bg-blue-100/50 text-blue-600 px-2 py-0.5 rounded font-bold uppercase tracking-tighter">#{{ t }}</span>
+                                    <span v-if="f.vFolder" class="text-[9px] bg-slate-200/50 text-slate-500 px-2 py-0.5 rounded font-bold uppercase tracking-tighter">{{ f.vFolder }}</span>
+                                </div>
+                            </div>
                             <span class="text-[10px] text-slate-400 font-bold uppercase flex-shrink-0">{{ formatDate(f.createdAt) }}</span>
                         </div>
                     </div>
@@ -1082,7 +1088,7 @@ const uiHTML = `
                     editingFile: null, 
                     newTag: '',
                     dragActive: false, 
-                    uploadingFiles: [], // YENİ: Massivə çevrildi 
+                    uploadingFiles: [], 
                     uploadTags: [], 
                     uploadVFolder: '',
                     searchTimeout: null,
@@ -1270,7 +1276,6 @@ const uiHTML = `
                     e.preventDefault();
                     this.dragActive = false;
                     
-                    // YENİ: Çoxlu faylları qəbul edirik
                     if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
                         this.uploadingFiles = Array.from(e.dataTransfer.files);
                         this.uploadTags = [];
@@ -1287,7 +1292,6 @@ const uiHTML = `
                 async confirmUpload() {
                     const formData = new FormData();
                     
-                    // YENİ: Bütün faylları "files" açarı ilə formData-ya əlavə edirik
                     this.uploadingFiles.forEach(file => {
                         formData.append('files', file);
                     });
@@ -1296,7 +1300,7 @@ const uiHTML = `
                     formData.append('vFolder', this.uploadVFolder);
 
                     await fetch('/api/upload', { method: 'POST', body: formData });
-                    this.uploadingFiles = []; // Təmizləyirik
+                    this.uploadingFiles = []; 
                 },
                 async saveNote() {
                     if (!this.noteTitle.trim() || !this.noteContent.trim()) {
