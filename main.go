@@ -158,20 +158,24 @@ func getNextVersion(dir, filename string) (string, string) {
 	}
 }
 
-// --- MƏTN ÇIXARICI (TEXT EXTRACTOR) - Faza 1 (Yalnız Mətn Faylları) ---
+// --- MƏTN ÇIXARICI (TEXT EXTRACTOR) - Faza 1 ---
 func extractText(filePath string) string {
 	ext := strings.ToLower(filepath.Ext(filePath))
-	
+
 	// Faza 1 üçün yalnız bu uzantıları oxuyuruq
 	textExtensions := map[string]bool{
-		".txt": true, ".md": true, ".json": true, ".csv": true, 
+		".txt": true, ".md": true, ".json": true, ".csv": true,
 		".log": true, ".html": true, ".css": true, ".js": true, ".xml": true,
 	}
 
 	if textExtensions[ext] {
-		content, err := os.ReadFile(filePath)
-		if err == nil {
-			return string(content)
+		// YADDAŞI QORUMAQ ÜÇÜN: Yalnız 5 MB-dan kiçik faylları oxuyuruq
+		info, err := os.Stat(filePath)
+		if err == nil && info.Size() <= 5*1024*1024 { // 5 MB limit
+			content, err := os.ReadFile(filePath)
+			if err == nil {
+				return string(content)
+			}
 		}
 	}
 	return ""
@@ -230,7 +234,6 @@ func saveDB() {
 }
 
 func indexFileToBleve(f FileData) {
-	// Bleve-yə yazılacaq məlumat strukturu
 	doc := struct {
 		Name    string
 		Tags    []string
@@ -240,10 +243,9 @@ func indexFileToBleve(f FileData) {
 		Name:    f.Name,
 		Tags:    f.Tags,
 		VFolder: f.VFolder,
-		Content: extractText(f.Path), // Faylın içini oxuyuruq
+		Content: extractText(f.Path),
 	}
-	
-	// Bleve bazasına ID ilə birlikdə əlavə edirik
+
 	searchIndex.Index(f.ID, doc)
 }
 
@@ -259,7 +261,9 @@ func performScan(pathsToScan []string) {
 
 	for _, dir := range pathsToScan {
 		filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-			if err != nil { return nil }
+			if err != nil {
+				return nil
+			}
 			if d.IsDir() {
 				name := d.Name()
 				if name == ".git" || name == "node_modules" || name == "Windows" || name == "AppData" || name == "sys" || name == indexFolder {
@@ -267,7 +271,7 @@ func performScan(pathsToScan []string) {
 				}
 				return nil
 			}
-			
+
 			// Yalnız yeni faylları əlavə edirik
 			if !existingPaths[path] {
 				hash := md5.Sum([]byte(path))
@@ -280,12 +284,12 @@ func performScan(pathsToScan []string) {
 					Tags:      []string{},
 					CreatedAt: time.Now(),
 				}
-				
+
 				newFiles = append(newFiles, newFile)
 				existingPaths[path] = true
-				
-				// Arxa fonda Bleve indeksinə əlavə et
-				go indexFileToBleve(newFile) 
+
+				// OOM xətasının qarşısını almaq üçün paralel (go) yox, sinxron işlədirik
+				indexFileToBleve(newFile)
 			}
 			return nil
 		})
@@ -296,7 +300,7 @@ func performScan(pathsToScan []string) {
 		state.Files = append(state.Files, newFiles...)
 		state.mu.Unlock()
 		go saveDB()
-		fmt.Printf("✅ Skan bitdi: %d yeni fayl tapıldı və indekslənir!\n", len(newFiles))
+		fmt.Printf("✅ Skan bitdi: %d yeni fayl tapıldı və indeksləndi!\n", len(newFiles))
 	}
 }
 
@@ -327,27 +331,33 @@ func autoStartupScan() {
 func searchHandler(w http.ResponseWriter, r *http.Request) {
 	queryText := strings.ToLower(r.URL.Query().Get("q"))
 	folderFilter := r.URL.Query().Get("folder")
-	
+
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	if limit <= 0 { limit = 50 } 
+	if limit <= 0 {
+		limit = 50
+	}
 
 	results := []SearchResultItem{}
 
-	// Əgər ancaq qovluq filteri varsa (Mətn axtarışı yoxdursa) - Köhnə məntiqlə işləyirik
+	// Əgər ancaq qovluq filteri varsa
 	if queryText == "" && folderFilter != "" {
 		state.mu.RLock()
 		for _, f := range state.Files {
 			if f.VFolder == folderFilter {
 				results = append(results, SearchResultItem{FileData: f})
 			}
-			if len(results) >= limit+offset { break }
+			if len(results) >= limit+offset {
+				break
+			}
 		}
 		state.mu.RUnlock()
 
 		if offset < len(results) {
 			end := offset + limit
-			if end > len(results) { end = len(results) }
+			if end > len(results) {
+				end = len(results)
+			}
 			results = results[offset:end]
 		} else {
 			results = []SearchResultItem{}
@@ -355,20 +365,17 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 		sendJSON(w, results)
 		return
 	}
-	
+
 	if queryText == "" {
 		sendJSON(w, []SearchResultItem{})
 		return
 	}
 
 	// === BLEVE AXTARIŞI ===
-	// Prefix Query (man* kimi) yaradırıq. 
-	// Bleve QueryStringQuery "man*" formatını birbaşa dəstəkləyir
 	bq := bleve.NewQueryStringQuery(queryText + "*")
-	
 	searchRequest := bleve.NewSearchRequestOptions(bq, limit, offset, false)
-	
-	// Hansı sahədə tapıldığını vurğulamaq üçün Highlight əlavə edirik
+
+	// Highlight
 	searchRequest.Highlight = bleve.NewHighlightWithStyle("html")
 	searchRequest.Highlight.AddField("Content")
 
@@ -378,7 +385,6 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Bleve ID-lər qaytarır, biz onları öz DB-mizdən (RAM) tapıb birləşdiririk
 	state.mu.RLock()
 	fileMap := make(map[string]FileData, len(state.Files))
 	for _, f := range state.Files {
@@ -388,16 +394,13 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 
 	for _, hit := range searchResult.Hits {
 		if fileData, ok := fileMap[hit.ID]; ok {
-			// Qovluq filteri tətbiq olunubsa yoxlayırıq
 			if folderFilter != "" && fileData.VFolder != folderFilter {
 				continue
 			}
 
 			snippetStr := ""
-			// Əgər "Content" (Mətnin içi) daxilində tapılıbsa, ilk 1-2 snippet-i birləşdiririk
 			if fragments, found := hit.Fragments["Content"]; found && len(fragments) > 0 {
 				snippetStr = strings.Join(fragments, " ... ")
-				// Bleve default olaraq <mark> teqi qoyur.
 			}
 
 			results = append(results, SearchResultItem{
@@ -465,24 +468,24 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 
 	isMoved := false
 	finalName := updated.Name
-	var fullUpdatedFile FileData // Bleve üçün tam fayl məlumatı
+	var fullUpdatedFile FileData
 
 	state.mu.Lock()
 	for i, f := range state.Files {
 		if f.ID == updated.ID {
 			state.Files[i].Tags = updated.Tags
-			
+
 			if f.VFolder != updated.VFolder {
 				oldPath := f.Path
-				
+
 				newDir := storageFolder
 				if updated.VFolder != "" {
 					newDir = filepath.Join(storageFolder, filepath.FromSlash(updated.VFolder))
 				}
-				os.MkdirAll(newDir, 0755) 
-				
+				os.MkdirAll(newDir, 0755)
+
 				newPath := filepath.Join(newDir, filepath.Base(oldPath))
-				
+
 				if oldPath != newPath {
 					err := os.Rename(oldPath, newPath)
 					if err != nil {
@@ -501,7 +504,7 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
-			
+
 			state.Files[i].VFolder = updated.VFolder
 			finalName = state.Files[i].Name
 			fullUpdatedFile = state.Files[i]
@@ -509,9 +512,8 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	state.mu.Unlock()
-	go saveDB() 
-	
-	// Metadata dəyişdiyi üçün Bleve-də indeksini yeniləyirik
+	go saveDB()
+
 	go indexFileToBleve(fullUpdatedFile)
 
 	if isMoved {
@@ -525,7 +527,10 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	err := r.ParseMultipartForm(500 << 20)
-	if err != nil { http.Error(w, err.Error(), 400); return }
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
 
 	files := r.MultipartForm.File["files"]
 	if len(files) == 0 {
@@ -551,7 +556,9 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	for _, fileHeader := range files {
 		file, err := fileHeader.Open()
-		if err != nil { continue }
+		if err != nil {
+			continue
+		}
 
 		finalName := fileHeader.Filename
 		destPath := filepath.Join(destDir, finalName)
@@ -606,8 +613,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 			state.Files = append(state.Files, theFile)
 		}
 		state.mu.Unlock()
-		
-		// Yenilənmiş/Yüklənmiş faylı Bleve-yə yaz
+
 		go indexFileToBleve(theFile)
 
 		uploadedNames = append(uploadedNames, finalName)
@@ -622,7 +628,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	go saveDB()
 
 	sendJSON(w, APIResponse{
-		Success: true, 
+		Success: true,
 		Message: fmt.Sprintf("%d fayl uğurla yükləndi", len(uploadedNames)),
 	})
 }
@@ -637,15 +643,17 @@ func createNoteHandler(w http.ResponseWriter, r *http.Request) {
 	safeTitle := strings.ReplaceAll(req.Title, " ", "_")
 	safeTitle = strings.ReplaceAll(safeTitle, "/", "-")
 	safeTitle = strings.ReplaceAll(safeTitle, "\\", "-")
-	if safeTitle == "" { safeTitle = "Adsiz_Qeyd" }
-	
+	if safeTitle == "" {
+		safeTitle = "Adsiz_Qeyd"
+	}
+
 	fileName := safeTitle + ".txt"
 	destDir := storageFolder
 	if req.VFolder != "" {
 		destDir = filepath.Join(storageFolder, filepath.FromSlash(req.VFolder))
 		os.MkdirAll(destDir, 0755)
 	}
-	
+
 	destPath := filepath.Join(destDir, fileName)
 
 	isVersioned := false
@@ -676,9 +684,9 @@ func createNoteHandler(w http.ResponseWriter, r *http.Request) {
 	state.mu.Lock()
 	state.Files = append(state.Files, newFile)
 	state.mu.Unlock()
-	
+
 	go saveDB()
-	go indexFileToBleve(newFile) // Yeni Note yaradılan kimi indeksə yazılır
+	go indexFileToBleve(newFile)
 
 	if isVersioned {
 		go broadcastEvent("Bu adda qeyd var idi, YENİ VERSİYASI yaradıldı: " + fileName)
@@ -691,8 +699,8 @@ func createNoteHandler(w http.ResponseWriter, r *http.Request) {
 
 func scanHandler(w http.ResponseWriter, r *http.Request) {
 	dir := r.URL.Query().Get("path")
-	if dir != "" { 
-		go performScan([]string{dir}) 
+	if dir != "" {
+		go performScan([]string{dir})
 	}
 	fmt.Fprint(w, "Scan initiated")
 }
@@ -714,13 +722,13 @@ func openFileHandler(w http.ResponseWriter, r *http.Request) {
 
 	if targetPath != "" {
 		switch runtime.GOOS {
-		case "windows": 
+		case "windows":
 			exec.Command("cmd", "/C", "start", "", targetPath).Start()
 			fmt.Fprint(w, "Opened on Windows")
-		case "darwin":  
+		case "darwin":
 			exec.Command("open", targetPath).Start()
 			fmt.Fprint(w, "Opened on Mac")
-		default:        
+		default:
 			exec.Command("xdg-open", targetPath).Start()
 			fmt.Fprint(w, "Opened on Linux")
 		}
@@ -830,7 +838,7 @@ func updateFileContentHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	
+
 	var updatedFileData FileData
 
 	state.mu.Lock()
@@ -853,12 +861,12 @@ func updateFileContentHandler(w http.ResponseWriter, r *http.Request) {
 		updatedFileData = newFile
 	} else {
 		state.Files[fileIndex].LastAccessed = time.Now()
-		state.Files[fileIndex].CreatedAt = time.Now() 
+		state.Files[fileIndex].CreatedAt = time.Now()
 		updatedFileData = state.Files[fileIndex]
 	}
 	state.mu.Unlock()
 
-	go saveDB() 
+	go saveDB()
 	go indexFileToBleve(updatedFileData) // Yenilənmiş məzmunu Bleve-yə yaz
 
 	if isVersioned {
@@ -876,18 +884,18 @@ func main() {
 	loadDB()
 	go autoStartupScan()
 
-	http.HandleFunc("/api/search", searchHandler) 
-	http.HandleFunc("/api/meta", metaHandler)     
+	http.HandleFunc("/api/search", searchHandler)
+	http.HandleFunc("/api/meta", metaHandler)
 	http.HandleFunc("/api/update", updateHandler)
 	http.HandleFunc("/api/upload", uploadHandler)
 	http.HandleFunc("/api/create-note", createNoteHandler)
 	http.HandleFunc("/api/scan", scanHandler)
 	http.HandleFunc("/api/open", openFileHandler)
-	http.HandleFunc("/api/download", downloadHandler) 
-	
+	http.HandleFunc("/api/download", downloadHandler)
+
 	http.HandleFunc("/api/get-content", getFileContentHandler)
 	http.HandleFunc("/api/update-content", updateFileContentHandler)
-	
+
 	http.HandleFunc("/api/events", eventsHandler)
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -902,9 +910,9 @@ func main() {
 	for {
 		listener, err = net.Listen("tcp", fmt.Sprintf(":%d", port))
 		if err == nil {
-			break 
+			break
 		}
-		port++ 
+		port++
 	}
 
 	fmt.Printf("🚀 Server %d portunda hazırdır. UI: http://localhost:%d\n", port, port)
