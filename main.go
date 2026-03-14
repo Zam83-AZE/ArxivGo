@@ -34,12 +34,14 @@ type FileData struct {
 	Reads        int       `json:"reads"`
 	CreatedAt    time.Time `json:"createdAt"`
 	LastAccessed time.Time `json:"lastAccessed"`
+	Size         int64     `json:"size"`    // Yeni: Dəyişikliyi izləmək üçün
+	ModTime      time.Time `json:"modTime"` // Yeni: Tarixi izləmək üçün
+	Indexed      bool      `json:"indexed"` // Yeni: Arxa fonda Bleve-yə düşdüyünü bilmək üçün
 }
 
-// Bleve axtarış nəticəsində UI-a qaytaracağımız xüsusi struktur
 type SearchResultItem struct {
 	FileData
-	Snippet string `json:"snippet"` // Tapılan mətn parçası (Highlighted)
+	Snippet string `json:"snippet"`
 }
 
 type AppState struct {
@@ -51,6 +53,7 @@ type MetaResponse struct {
 	Recents        []FileData `json:"recents"`
 	VirtualFolders []string   `json:"folders"`
 	TotalFiles     int        `json:"totalFiles"`
+	IndexingCount  int        `json:"indexingCount"` // UI-da neçə faylın qaldığını göstərəcək
 }
 
 type NoteRequest struct {
@@ -75,12 +78,11 @@ type APIResponse struct {
 
 const dbPath = "data.json"
 const storageFolder = "ArxivGo_Storage"
-const indexFolder = "ArxivGo_Index.bleve" // Bleve indeks qovluğu
+const indexFolder = "ArxivGo_Index.bleve"
 
 var state AppState
-var searchIndex bleve.Index // Qlobal Bleve Index Dəyişəni
+var searchIndex bleve.Index
 
-// --- SSE (CANLI BİLDİRİŞ) SİSTEMİ ---
 var sseClients = make(map[chan string]bool)
 var sseMu sync.Mutex
 
@@ -129,8 +131,6 @@ func eventsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// --- KÖMƏKÇİ FUNKSİYALAR ---
-
 func sendJSON(w http.ResponseWriter, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(data)
@@ -158,20 +158,16 @@ func getNextVersion(dir, filename string) (string, string) {
 	}
 }
 
-// --- MƏTN ÇIXARICI (TEXT EXTRACTOR) - Faza 1 ---
 func extractText(filePath string) string {
 	ext := strings.ToLower(filepath.Ext(filePath))
-
-	// Faza 1 üçün yalnız bu uzantıları oxuyuruq
 	textExtensions := map[string]bool{
 		".txt": true, ".md": true, ".json": true, ".csv": true,
 		".log": true, ".html": true, ".css": true, ".js": true, ".xml": true,
 	}
 
 	if textExtensions[ext] {
-		// YADDAŞI QORUMAQ ÜÇÜN: Yalnız 5 MB-dan kiçik faylları oxuyuruq
 		info, err := os.Stat(filePath)
-		if err == nil && info.Size() <= 5*1024*1024 { // 5 MB limit
+		if err == nil && info.Size() <= 5*1024*1024 { // 5 MB RAM qoruyucu limit
 			content, err := os.ReadFile(filePath)
 			if err == nil {
 				return string(content)
@@ -181,19 +177,15 @@ func extractText(filePath string) string {
 	return ""
 }
 
-// --- BACKEND MƏNTİQİ ---
-
 func initStorage() {
 	if _, err := os.Stat(storageFolder); os.IsNotExist(err) {
 		os.MkdirAll(storageFolder, 0755)
 	}
 }
 
-// Bleve İndeksinin Başladılması
 func initSearchIndex() {
 	var err error
 	if _, errStat := os.Stat(indexFolder); os.IsNotExist(errStat) {
-		// İndeks yoxdursa yenisini yarat
 		mapping := bleve.NewIndexMapping()
 		searchIndex, err = bleve.New(indexFolder, mapping)
 		if err != nil {
@@ -201,7 +193,6 @@ func initSearchIndex() {
 		}
 		fmt.Println("🌟 Yeni Bleve axtarış indeksi yaradıldı.")
 	} else {
-		// Mövcud indeksi aç
 		searchIndex, err = bleve.Open(indexFolder)
 		if err != nil {
 			log.Fatalf("Bleve indeksi açıla bilmədi: %v", err)
@@ -233,31 +224,69 @@ func saveDB() {
 	os.WriteFile(dbPath, data, 0644)
 }
 
-func indexFileToBleve(f FileData) {
-	doc := struct {
-		Name    string
-		Tags    []string
-		VFolder string
-		Content string
-	}{
-		Name:    f.Name,
-		Tags:    f.Tags,
-		VFolder: f.VFolder,
-		Content: extractText(f.Path),
-	}
+// ARXA FON İŞÇİSİ (BACKGROUND WORKER) - Əsas yükü çəkən hissə
+func startBackgroundIndexer() {
+	for {
+		var batch []FileData
+		state.mu.RLock()
+		// Növbədə gözləyən (Indexed = false) 10 faylı tapırıq
+		for _, f := range state.Files {
+			if !f.Indexed {
+				batch = append(batch, f)
+				if len(batch) >= 10 {
+					break
+				}
+			}
+		}
+		state.mu.RUnlock()
 
-	searchIndex.Index(f.ID, doc)
+		// Əgər indekslənəcək fayl yoxdursa, CPU dincəlsin
+		if len(batch) == 0 {
+			time.Sleep(3 * time.Second)
+			continue
+		}
+
+		// Seçilən faylların məzmununu Bleve-yə yazırıq
+		for _, f := range batch {
+			doc := struct {
+				Name    string
+				Tags    []string
+				VFolder string
+				Content string
+			}{
+				Name:    f.Name,
+				Tags:    f.Tags,
+				VFolder: f.VFolder,
+				Content: extractText(f.Path),
+			}
+			searchIndex.Index(f.ID, doc)
+
+			// Və JSON DB-də "İndeksləndi" (true) olaraq işarələyirik
+			state.mu.Lock()
+			for i, sf := range state.Files {
+				if sf.ID == f.ID {
+					state.Files[i].Indexed = true
+					break
+				}
+			}
+			state.mu.Unlock()
+		}
+
+		saveDB()
+		time.Sleep(500 * time.Millisecond) // Çox yormamaq üçün fasilə
+	}
 }
 
+// FAZA 1 - İLDIRIM SÜRƏTLİ SKAN (Yalnız Metadata)
 func performScan(pathsToScan []string) {
 	state.mu.RLock()
-	existingPaths := make(map[string]bool, len(state.Files))
+	existingFiles := make(map[string]FileData, len(state.Files))
 	for _, f := range state.Files {
-		existingPaths[f.Path] = true
+		existingFiles[f.Path] = f
 	}
 	state.mu.RUnlock()
 
-	var newFiles []FileData
+	var newOrUpdated []FileData
 
 	for _, dir := range pathsToScan {
 		filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
@@ -272,8 +301,14 @@ func performScan(pathsToScan []string) {
 				return nil
 			}
 
-			// Yalnız yeni faylları əlavə edirik
-			if !existingPaths[path] {
+			info, err := d.Info()
+			if err != nil {
+				return nil
+			}
+
+			existing, exists := existingFiles[path]
+			if !exists {
+				// Tamamilə yeni fayl
 				hash := md5.Sum([]byte(path))
 				uniqueID := hex.EncodeToString(hash[:])
 
@@ -283,24 +318,43 @@ func performScan(pathsToScan []string) {
 					Path:      path,
 					Tags:      []string{},
 					CreatedAt: time.Now(),
+					Size:      info.Size(),
+					ModTime:   info.ModTime(),
+					Indexed:   false, // Arxa fon işçisinə siqnal verir
 				}
-
-				newFiles = append(newFiles, newFile)
-				existingPaths[path] = true
-
-				// OOM xətasının qarşısını almaq üçün paralel (go) yox, sinxron işlədirik
-				indexFileToBleve(newFile)
+				newOrUpdated = append(newOrUpdated, newFile)
+			} else {
+				// Fayl artıq var, amma içində dəyişiklik olubmu? (Ölçü və ya tarix yoxlanılır)
+				if existing.Size != info.Size() || !existing.ModTime.Equal(info.ModTime()) {
+					existing.Size = info.Size()
+					existing.ModTime = info.ModTime()
+					existing.Indexed = false // Dəyişib! Yenidən indeksləməyə göndər
+					newOrUpdated = append(newOrUpdated, existing)
+				}
 			}
 			return nil
 		})
 	}
 
-	if len(newFiles) > 0 {
+	if len(newOrUpdated) > 0 {
 		state.mu.Lock()
-		state.Files = append(state.Files, newFiles...)
+
+		fileMap := make(map[string]int)
+		for i, f := range state.Files {
+			fileMap[f.ID] = i
+		}
+
+		for _, f := range newOrUpdated {
+			if idx, ok := fileMap[f.ID]; ok {
+				state.Files[idx] = f
+			} else {
+				state.Files = append(state.Files, f)
+			}
+		}
 		state.mu.Unlock()
+
 		go saveDB()
-		fmt.Printf("✅ Skan bitdi: %d yeni fayl tapıldı və indeksləndi!\n", len(newFiles))
+		fmt.Printf("✅ Skan bitdi: %d fayl tapıldı/yeniləndi. Arxa fonda məzmunları oxunur...\n", len(newOrUpdated))
 	}
 }
 
@@ -326,10 +380,8 @@ func autoStartupScan() {
 	performScan(pathsToScan)
 }
 
-// --- API HANDLERS ---
-
 func searchHandler(w http.ResponseWriter, r *http.Request) {
-	queryText := strings.ToLower(r.URL.Query().Get("q"))
+	queryText := r.URL.Query().Get("q")
 	folderFilter := r.URL.Query().Get("folder")
 
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
@@ -338,10 +390,9 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 		limit = 50
 	}
 
-	results := []SearchResultItem{}
-
 	// Əgər ancaq qovluq filteri varsa
 	if queryText == "" && folderFilter != "" {
+		results := []SearchResultItem{}
 		state.mu.RLock()
 		for _, f := range state.Files {
 			if f.VFolder == folderFilter {
@@ -371,46 +422,106 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// === BLEVE AXTARIŞI ===
-	bq := bleve.NewQueryStringQuery(queryText + "*")
-	searchRequest := bleve.NewSearchRequestOptions(bq, limit, offset, false)
+	// === HİBRİD AXTARIŞ SİSTEMİ === //
+	queryLower := strings.ToLower(queryText)
+	searchWords := strings.Fields(queryLower)
 
-	// Highlight
+	// Map istifadə edirik ki, eyni nəticələr təkrarlanmasın (Məsələn həm Bleve tapıb, həm RAM)
+	ramResults := make(map[string]SearchResultItem)
+
+	state.mu.RLock()
+	// 1. RAM (Sürətli) Axtarış: Ada və Teqlərə görə (Bleve-i gözləmədən anında tapır)
+	for _, f := range state.Files {
+		if folderFilter != "" && f.VFolder != folderFilter {
+			continue
+		}
+
+		match := true
+		for _, word := range searchWords {
+			wordMatch := strings.Contains(strings.ToLower(f.Name), word)
+			if !wordMatch {
+				for _, t := range f.Tags {
+					if strings.Contains(strings.ToLower(t), word) {
+						wordMatch = true
+						break
+					}
+				}
+			}
+			if !wordMatch {
+				match = false
+				break
+			}
+		}
+
+		if match {
+			ramResults[f.ID] = SearchResultItem{FileData: f, Snippet: ""} // Hələ kiçik mətn parçası (snippet) yoxdur
+		}
+	}
+	state.mu.RUnlock()
+
+	// 2. Bleve Mətn Axtarışı
+	bq := bleve.NewQueryStringQuery(queryText + "*")
+	searchRequest := bleve.NewSearchRequestOptions(bq, limit*2, 0, false)
 	searchRequest.Highlight = bleve.NewHighlightWithStyle("html")
 	searchRequest.Highlight.AddField("Content")
 
 	searchResult, err := searchIndex.Search(searchRequest)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
 
-	state.mu.RLock()
-	fileMap := make(map[string]FileData, len(state.Files))
-	for _, f := range state.Files {
-		fileMap[f.ID] = f
-	}
-	state.mu.RUnlock()
+	if err == nil {
+		state.mu.RLock()
+		for _, hit := range searchResult.Hits {
+			var fileData FileData
+			found := false
+			for _, f := range state.Files {
+				if f.ID == hit.ID {
+					fileData = f
+					found = true
+					break
+				}
+			}
 
-	for _, hit := range searchResult.Hits {
-		if fileData, ok := fileMap[hit.ID]; ok {
+			if !found {
+				continue
+			}
 			if folderFilter != "" && fileData.VFolder != folderFilter {
 				continue
 			}
 
 			snippetStr := ""
-			if fragments, found := hit.Fragments["Content"]; found && len(fragments) > 0 {
+			if fragments, ok := hit.Fragments["Content"]; ok && len(fragments) > 0 {
 				snippetStr = strings.Join(fragments, " ... ")
 			}
 
-			results = append(results, SearchResultItem{
+			// Nəticəni yenilə (Bleve bizə Snippet qazandırdı)
+			ramResults[hit.ID] = SearchResultItem{
 				FileData: fileData,
 				Snippet:  snippetStr,
-			})
+			}
 		}
+		state.mu.RUnlock()
 	}
 
-	sendJSON(w, results)
+	// Nəticələri Slice-ə çeviririk və çeşidləyirik
+	var finalResults []SearchResultItem
+	for _, res := range ramResults {
+		finalResults = append(finalResults, res)
+	}
+
+	sort.Slice(finalResults, func(i, j int) bool {
+		return finalResults[i].Name < finalResults[j].Name
+	})
+
+	// Pagination
+	start := offset
+	end := offset + limit
+	if start > len(finalResults) {
+		start = len(finalResults)
+	}
+	if end > len(finalResults) {
+		end = len(finalResults)
+	}
+
+	sendJSON(w, finalResults[start:end])
 }
 
 func metaHandler(w http.ResponseWriter, r *http.Request) {
@@ -420,6 +531,7 @@ func metaHandler(w http.ResponseWriter, r *http.Request) {
 	foldersMap := make(map[string]bool)
 	var recents []FileData
 	var recentCandidates []FileData
+	indexingCount := 0 // UI-a göndəriləcək məlumat
 
 	if len(state.Files) > 100 {
 		recentCandidates = make([]FileData, 100)
@@ -443,6 +555,9 @@ func metaHandler(w http.ResponseWriter, r *http.Request) {
 		if f.VFolder != "" {
 			foldersMap[f.VFolder] = true
 		}
+		if !f.Indexed {
+			indexingCount++
+		}
 	}
 
 	var folders []string
@@ -454,6 +569,7 @@ func metaHandler(w http.ResponseWriter, r *http.Request) {
 		Recents:        recents,
 		VirtualFolders: folders,
 		TotalFiles:     len(state.Files),
+		IndexingCount:  indexingCount,
 	}
 
 	sendJSON(w, resp)
@@ -468,7 +584,6 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 
 	isMoved := false
 	finalName := updated.Name
-	var fullUpdatedFile FileData
 
 	state.mu.Lock()
 	for i, f := range state.Files {
@@ -477,7 +592,6 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 
 			if f.VFolder != updated.VFolder {
 				oldPath := f.Path
-
 				newDir := storageFolder
 				if updated.VFolder != "" {
 					newDir = filepath.Join(storageFolder, filepath.FromSlash(updated.VFolder))
@@ -506,15 +620,13 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			state.Files[i].VFolder = updated.VFolder
+			state.Files[i].Indexed = false // Teqlər/Qovluq dəyişdiyi üçün arxa fon işçisi yenidən Bleve-i yeniləyəcək
 			finalName = state.Files[i].Name
-			fullUpdatedFile = state.Files[i]
 			break
 		}
 	}
 	state.mu.Unlock()
 	go saveDB()
-
-	go indexFileToBleve(fullUpdatedFile)
 
 	if isMoved {
 		go broadcastEvent("Fayl başqa qovluğa köçürüldü: " + finalName)
@@ -586,7 +698,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		hash := md5.Sum([]byte(absPath))
 		uniqueID := hex.EncodeToString(hash[:])
 
-		var theFile FileData
+		newInfo, _ := os.Stat(absPath)
 
 		state.mu.Lock()
 		existsInDB := false
@@ -595,26 +707,29 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 				state.Files[i].Tags = tags
 				state.Files[i].VFolder = vFolder
 				state.Files[i].CreatedAt = time.Now()
+				state.Files[i].Size = newInfo.Size()
+				state.Files[i].ModTime = newInfo.ModTime()
+				state.Files[i].Indexed = false // Arxa fon işçisi işini biləcək!
 				existsInDB = true
-				theFile = state.Files[i]
 				break
 			}
 		}
 
 		if !existsInDB {
-			theFile = FileData{
+			theFile := FileData{
 				ID:        uniqueID,
 				Name:      finalName,
 				Path:      absPath,
 				VFolder:   vFolder,
 				Tags:      tags,
 				CreatedAt: time.Now(),
+				Size:      newInfo.Size(),
+				ModTime:   newInfo.ModTime(),
+				Indexed:   false, // Bleve-yə arxa fonda düşəcək
 			}
 			state.Files = append(state.Files, theFile)
 		}
 		state.mu.Unlock()
-
-		go indexFileToBleve(theFile)
 
 		uploadedNames = append(uploadedNames, finalName)
 
@@ -671,6 +786,7 @@ func createNoteHandler(w http.ResponseWriter, r *http.Request) {
 	absPath, _ := filepath.Abs(destPath)
 	hash := md5.Sum([]byte(absPath))
 	uniqueID := hex.EncodeToString(hash[:])
+	info, _ := os.Stat(absPath)
 
 	newFile := FileData{
 		ID:        uniqueID,
@@ -679,6 +795,9 @@ func createNoteHandler(w http.ResponseWriter, r *http.Request) {
 		VFolder:   req.VFolder,
 		Tags:      req.Tags,
 		CreatedAt: time.Now(),
+		Size:      info.Size(),
+		ModTime:   info.ModTime(),
+		Indexed:   false, // Arxa fonda indekslənəcək
 	}
 
 	state.mu.Lock()
@@ -686,7 +805,6 @@ func createNoteHandler(w http.ResponseWriter, r *http.Request) {
 	state.mu.Unlock()
 
 	go saveDB()
-	go indexFileToBleve(newFile)
 
 	if isVersioned {
 		go broadcastEvent("Bu adda qeyd var idi, YENİ VERSİYASI yaradıldı: " + fileName)
@@ -839,13 +957,12 @@ func updateFileContentHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var updatedFileData FileData
-
 	state.mu.Lock()
 	if isVersioned {
 		absPath, _ := filepath.Abs(finalPath)
 		hash := md5.Sum([]byte(absPath))
 		uniqueID := hex.EncodeToString(hash[:])
+		newInfo, _ := os.Stat(absPath)
 
 		newFile := FileData{
 			ID:           uniqueID,
@@ -856,18 +973,22 @@ func updateFileContentHandler(w http.ResponseWriter, r *http.Request) {
 			Reads:        0,
 			CreatedAt:    time.Now(),
 			LastAccessed: time.Now(),
+			Size:         newInfo.Size(),
+			ModTime:      newInfo.ModTime(),
+			Indexed:      false, // Arxa fonda indekslənəcək
 		}
 		state.Files = append(state.Files, newFile)
-		updatedFileData = newFile
 	} else {
+		newInfo, _ := os.Stat(finalPath)
 		state.Files[fileIndex].LastAccessed = time.Now()
 		state.Files[fileIndex].CreatedAt = time.Now()
-		updatedFileData = state.Files[fileIndex]
+		state.Files[fileIndex].Size = newInfo.Size()
+		state.Files[fileIndex].ModTime = newInfo.ModTime()
+		state.Files[fileIndex].Indexed = false // Dəyişiklik olundu, Bleve-yə arxa fonda düşəcək
 	}
 	state.mu.Unlock()
 
 	go saveDB()
-	go indexFileToBleve(updatedFileData) // Yenilənmiş məzmunu Bleve-yə yaz
 
 	if isVersioned {
 		go broadcastEvent("Fayl redaktə edildi və YENİ VERSİYA yaradıldı: " + finalName)
@@ -880,9 +1001,12 @@ func updateFileContentHandler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	initStorage()
-	initSearchIndex() // BLEVE Başladılması
+	initSearchIndex()
 	loadDB()
 	go autoStartupScan()
+
+	// YENİ: Arxa Fon İşçisi (Background Indexer) başladı
+	go startBackgroundIndexer()
 
 	http.HandleFunc("/api/search", searchHandler)
 	http.HandleFunc("/api/meta", metaHandler)
@@ -938,11 +1062,7 @@ const uiHTML = `
         .custom-scroll::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
         .drop-zone-active { z-index: 9999; opacity: 1; pointer-events: all; }
         .drop-zone-inactive { z-index: -1; opacity: 0; pointer-events: none; }
-        
-        /* Snippet içindəki qalın mətnlər (Bleve mark) üçün */
         mark { background-color: #fef08a; padding: 0 2px; border-radius: 2px; font-weight: bold; color: #b45309; }
-        
-        /* Toast Animasiyaları */
         .toast-enter-active, .toast-leave-active { transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
         .toast-enter-from { opacity: 0; transform: translateX(50px); }
         .toast-leave-to { opacity: 0; transform: translateX(50px); }
@@ -974,7 +1094,13 @@ const uiHTML = `
         <div class="w-full max-w-2xl px-6 relative z-10 flex flex-col">
             <div v-if="!activeModal && !editingFile && uploadingFiles.length === 0" class="text-center w-full">
                 <h1 class="text-5xl font-light mb-1 select-none">Arxiv<span class="font-bold text-blue-600">Go</span></h1>
-                <p class="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-10">Cəmi Fayl: {{ totalFiles }}</p>
+                
+                <p class="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-10 flex items-center justify-center gap-2">
+                    Cəmi Fayl: {{ totalFiles }}
+                    <span v-if="indexingCount > 0" class="text-orange-500 bg-orange-50 px-2 py-0.5 rounded-full border border-orange-100 flex items-center gap-1 normal-case tracking-normal">
+                        <i data-lucide="loader" class="w-3 h-3 animate-spin"></i> {{ indexingCount }} fayl məzmunu indekslənir...
+                    </span>
+                </p>
 
                 <div class="flex justify-center gap-3 mb-8">
                     <button @click="openModal('folders')" class="px-5 py-2 rounded-xl bg-slate-50 text-slate-600 text-xs font-bold hover:bg-slate-100 transition uppercase tracking-widest border border-slate-100">Qovluqlar</button>
@@ -1000,6 +1126,7 @@ const uiHTML = `
                                 <div class="w-full min-w-0">
                                     <div class="text-sm font-medium break-words">{{ f.name }}</div>
                                     <div v-if="f.snippet" class="text-xs text-slate-500 mt-1 italic leading-relaxed" v-html="f.snippet"></div>
+                                    <div v-else-if="query && !f.indexed" class="text-[10px] text-orange-400 mt-1 italic leading-relaxed">Mətn hələ axtarış sisteminə yüklənir...</div>
                                     
                                     <div class="flex gap-2 mt-2 flex-wrap">
                                         <span v-for="t in f.tags" class="text-[9px] bg-blue-50 text-blue-500 px-2 py-0.5 rounded font-bold uppercase tracking-tighter">#{{ t }}</span>
@@ -1206,6 +1333,7 @@ const uiHTML = `
                     recents: [], 
                     virtualFolders: [],
                     totalFiles: 0,
+                    indexingCount: 0,
                     activeModal: null, 
                     editingFile: null, 
                     newTag: '',
@@ -1238,12 +1366,9 @@ const uiHTML = `
                         this.toasts = this.toasts.filter(t => t.id !== id);
                     }, 4000);
 
-                    if ("Notification" in window) {
-                        if (Notification.permission === "granted") {
-                            new Notification("ArxivGo", { body: message });
-                        }
+                    if ("Notification" in window && Notification.permission === "granted") {
+                        new Notification("ArxivGo", { body: message });
                     }
-                    
                     this.$nextTick(() => lucide.createIcons());
                 },
 
@@ -1254,6 +1379,7 @@ const uiHTML = `
                         this.recents = data.recents || [];
                         this.virtualFolders = data.folders || [];
                         this.totalFiles = data.totalFiles || 0;
+                        this.indexingCount = data.indexingCount || 0;
                     }
                 },
                 async performSearch(isAppend = false) {
@@ -1466,6 +1592,13 @@ const uiHTML = `
             mounted() {
                 this.fetchMeta();
                 lucide.createIcons();
+                
+                // Hər saniyə UI-ı yeniləyirik ki, arxa fon prosesini görə bilək
+                setInterval(() => {
+                    if(!this.isSearching && !this.activeModal && !this.editingFile) {
+                        this.fetchMeta();
+                    }
+                }, 2000);
 
                 const evtSource = new EventSource('/api/events');
                 evtSource.onmessage = (event) => {
