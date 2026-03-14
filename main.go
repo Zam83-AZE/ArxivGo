@@ -19,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/blevesearch/bleve/v2"
 )
 
 // --- MODELLƏR ---
@@ -32,6 +34,12 @@ type FileData struct {
 	Reads        int       `json:"reads"`
 	CreatedAt    time.Time `json:"createdAt"`
 	LastAccessed time.Time `json:"lastAccessed"`
+}
+
+// Bleve axtarış nəticəsində UI-a qaytaracağımız xüsusi struktur
+type SearchResultItem struct {
+	FileData
+	Snippet string `json:"snippet"` // Tapılan mətn parçası (Highlighted)
 }
 
 type AppState struct {
@@ -67,7 +75,10 @@ type APIResponse struct {
 
 const dbPath = "data.json"
 const storageFolder = "ArxivGo_Storage"
+const indexFolder = "ArxivGo_Index.bleve" // Bleve indeks qovluğu
+
 var state AppState
+var searchIndex bleve.Index // Qlobal Bleve Index Dəyişəni
 
 // --- SSE (CANLI BİLDİRİŞ) SİSTEMİ ---
 var sseClients = make(map[chan string]bool)
@@ -77,7 +88,6 @@ func broadcastEvent(message string) {
 	sseMu.Lock()
 	defer sseMu.Unlock()
 	for clientChan := range sseClients {
-		// Non-blocking send
 		select {
 		case clientChan <- message:
 		default:
@@ -148,11 +158,51 @@ func getNextVersion(dir, filename string) (string, string) {
 	}
 }
 
+// --- MƏTN ÇIXARICI (TEXT EXTRACTOR) - Faza 1 (Yalnız Mətn Faylları) ---
+func extractText(filePath string) string {
+	ext := strings.ToLower(filepath.Ext(filePath))
+	
+	// Faza 1 üçün yalnız bu uzantıları oxuyuruq
+	textExtensions := map[string]bool{
+		".txt": true, ".md": true, ".json": true, ".csv": true, 
+		".log": true, ".html": true, ".css": true, ".js": true, ".xml": true,
+	}
+
+	if textExtensions[ext] {
+		content, err := os.ReadFile(filePath)
+		if err == nil {
+			return string(content)
+		}
+	}
+	return ""
+}
+
 // --- BACKEND MƏNTİQİ ---
 
 func initStorage() {
 	if _, err := os.Stat(storageFolder); os.IsNotExist(err) {
 		os.MkdirAll(storageFolder, 0755)
+	}
+}
+
+// Bleve İndeksinin Başladılması
+func initSearchIndex() {
+	var err error
+	if _, errStat := os.Stat(indexFolder); os.IsNotExist(errStat) {
+		// İndeks yoxdursa yenisini yarat
+		mapping := bleve.NewIndexMapping()
+		searchIndex, err = bleve.New(indexFolder, mapping)
+		if err != nil {
+			log.Fatalf("Bleve indeksi yaradıla bilmədi: %v", err)
+		}
+		fmt.Println("🌟 Yeni Bleve axtarış indeksi yaradıldı.")
+	} else {
+		// Mövcud indeksi aç
+		searchIndex, err = bleve.Open(indexFolder)
+		if err != nil {
+			log.Fatalf("Bleve indeksi açıla bilmədi: %v", err)
+		}
+		fmt.Println("📦 Mövcud Bleve axtarış indeksi yükləndi.")
 	}
 }
 
@@ -179,6 +229,24 @@ func saveDB() {
 	os.WriteFile(dbPath, data, 0644)
 }
 
+func indexFileToBleve(f FileData) {
+	// Bleve-yə yazılacaq məlumat strukturu
+	doc := struct {
+		Name    string
+		Tags    []string
+		VFolder string
+		Content string
+	}{
+		Name:    f.Name,
+		Tags:    f.Tags,
+		VFolder: f.VFolder,
+		Content: extractText(f.Path), // Faylın içini oxuyuruq
+	}
+	
+	// Bleve bazasına ID ilə birlikdə əlavə edirik
+	searchIndex.Index(f.ID, doc)
+}
+
 func performScan(pathsToScan []string) {
 	state.mu.RLock()
 	existingPaths := make(map[string]bool, len(state.Files))
@@ -194,23 +262,30 @@ func performScan(pathsToScan []string) {
 			if err != nil { return nil }
 			if d.IsDir() {
 				name := d.Name()
-				if name == ".git" || name == "node_modules" || name == "Windows" || name == "AppData" || name == "sys" {
+				if name == ".git" || name == "node_modules" || name == "Windows" || name == "AppData" || name == "sys" || name == indexFolder {
 					return filepath.SkipDir
 				}
 				return nil
 			}
+			
+			// Yalnız yeni faylları əlavə edirik
 			if !existingPaths[path] {
 				hash := md5.Sum([]byte(path))
 				uniqueID := hex.EncodeToString(hash[:])
 
-				newFiles = append(newFiles, FileData{
+				newFile := FileData{
 					ID:        uniqueID,
 					Name:      d.Name(),
 					Path:      path,
 					Tags:      []string{},
 					CreatedAt: time.Now(),
-				})
+				}
+				
+				newFiles = append(newFiles, newFile)
 				existingPaths[path] = true
+				
+				// Arxa fonda Bleve indeksinə əlavə et
+				go indexFileToBleve(newFile) 
 			}
 			return nil
 		})
@@ -221,7 +296,7 @@ func performScan(pathsToScan []string) {
 		state.Files = append(state.Files, newFiles...)
 		state.mu.Unlock()
 		go saveDB()
-		fmt.Printf("✅ Skan bitdi: %d yeni fayl tapıldı!\n", len(newFiles))
+		fmt.Printf("✅ Skan bitdi: %d yeni fayl tapıldı və indekslənir!\n", len(newFiles))
 	}
 }
 
@@ -250,73 +325,89 @@ func autoStartupScan() {
 // --- API HANDLERS ---
 
 func searchHandler(w http.ResponseWriter, r *http.Request) {
-	query := strings.ToLower(r.URL.Query().Get("q"))
+	queryText := strings.ToLower(r.URL.Query().Get("q"))
 	folderFilter := r.URL.Query().Get("folder")
 	
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	if limit <= 0 { limit = 50 } 
-	
-	var tagMatches []FileData
-	var nameMatches []FileData
-	
-	targetCount := offset + limit
-	
-	state.mu.RLock()
-	defer state.mu.RUnlock()
 
-	for _, f := range state.Files {
-		if folderFilter != "" && f.VFolder != folderFilter {
-			continue
-		}
-		if query == "" {
-			if len(nameMatches) < targetCount {
-				nameMatches = append(nameMatches, f)
-			}
-			if len(nameMatches) >= targetCount { break }
-			continue
-		}
+	results := []SearchResultItem{}
 
-		isTagMatch := false
-		for _, t := range f.Tags {
-			if strings.Contains(strings.ToLower(t), query) {
-				isTagMatch = true
-				break
+	// Əgər ancaq qovluq filteri varsa (Mətn axtarışı yoxdursa) - Köhnə məntiqlə işləyirik
+	if queryText == "" && folderFilter != "" {
+		state.mu.RLock()
+		for _, f := range state.Files {
+			if f.VFolder == folderFilter {
+				results = append(results, SearchResultItem{FileData: f})
 			}
+			if len(results) >= limit+offset { break }
 		}
+		state.mu.RUnlock()
 
-		if isTagMatch {
-			if len(tagMatches) < targetCount {
-				tagMatches = append(tagMatches, f)
-			}
+		if offset < len(results) {
+			end := offset + limit
+			if end > len(results) { end = len(results) }
+			results = results[offset:end]
 		} else {
-			if strings.Contains(strings.ToLower(f.Name), query) {
-				if len(nameMatches) < targetCount {
-					nameMatches = append(nameMatches, f)
-				}
+			results = []SearchResultItem{}
+		}
+		sendJSON(w, results)
+		return
+	}
+	
+	if queryText == "" {
+		sendJSON(w, []SearchResultItem{})
+		return
+	}
+
+	// === BLEVE AXTARIŞI ===
+	// Prefix Query (man* kimi) yaradırıq. 
+	// Bleve QueryStringQuery "man*" formatını birbaşa dəstəkləyir
+	bq := bleve.NewQueryStringQuery(queryText + "*")
+	
+	searchRequest := bleve.NewSearchRequestOptions(bq, limit, offset, false)
+	
+	// Hansı sahədə tapıldığını vurğulamaq üçün Highlight əlavə edirik
+	searchRequest.Highlight = bleve.NewHighlightWithStyle("html")
+	searchRequest.Highlight.AddField("Content")
+
+	searchResult, err := searchIndex.Search(searchRequest)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	// Bleve ID-lər qaytarır, biz onları öz DB-mizdən (RAM) tapıb birləşdiririk
+	state.mu.RLock()
+	fileMap := make(map[string]FileData, len(state.Files))
+	for _, f := range state.Files {
+		fileMap[f.ID] = f
+	}
+	state.mu.RUnlock()
+
+	for _, hit := range searchResult.Hits {
+		if fileData, ok := fileMap[hit.ID]; ok {
+			// Qovluq filteri tətbiq olunubsa yoxlayırıq
+			if folderFilter != "" && fileData.VFolder != folderFilter {
+				continue
 			}
-		}
 
-		if len(tagMatches) >= targetCount && len(nameMatches) >= targetCount {
-			break
+			snippetStr := ""
+			// Əgər "Content" (Mətnin içi) daxilində tapılıbsa, ilk 1-2 snippet-i birləşdiririk
+			if fragments, found := hit.Fragments["Content"]; found && len(fragments) > 0 {
+				snippetStr = strings.Join(fragments, " ... ")
+				// Bleve default olaraq <mark> teqi qoyur.
+			}
+
+			results = append(results, SearchResultItem{
+				FileData: fileData,
+				Snippet:  snippetStr,
+			})
 		}
 	}
 
-	var allMatches []FileData
-	allMatches = append(allMatches, tagMatches...)
-	allMatches = append(allMatches, nameMatches...)
-
-	results := []FileData{}
-	if offset < len(allMatches) {
-		end := offset + limit
-		if end > len(allMatches) {
-			end = len(allMatches)
-		}
-		results = allMatches[offset:end]
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(results)
+	sendJSON(w, results)
 }
 
 func metaHandler(w http.ResponseWriter, r *http.Request) {
@@ -362,8 +453,7 @@ func metaHandler(w http.ResponseWriter, r *http.Request) {
 		TotalFiles:     len(state.Files),
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	sendJSON(w, resp)
 }
 
 func updateHandler(w http.ResponseWriter, r *http.Request) {
@@ -375,6 +465,7 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 
 	isMoved := false
 	finalName := updated.Name
+	var fullUpdatedFile FileData // Bleve üçün tam fayl məlumatı
 
 	state.mu.Lock()
 	for i, f := range state.Files {
@@ -413,11 +504,15 @@ func updateHandler(w http.ResponseWriter, r *http.Request) {
 			
 			state.Files[i].VFolder = updated.VFolder
 			finalName = state.Files[i].Name
+			fullUpdatedFile = state.Files[i]
 			break
 		}
 	}
 	state.mu.Unlock()
 	go saveDB() 
+	
+	// Metadata dəyişdiyi üçün Bleve-də indeksini yeniləyirik
+	go indexFileToBleve(fullUpdatedFile)
 
 	if isMoved {
 		go broadcastEvent("Fayl başqa qovluğa köçürüldü: " + finalName)
@@ -484,6 +579,8 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		hash := md5.Sum([]byte(absPath))
 		uniqueID := hex.EncodeToString(hash[:])
 
+		var theFile FileData
+
 		state.mu.Lock()
 		existsInDB := false
 		for i, f := range state.Files {
@@ -492,12 +589,13 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 				state.Files[i].VFolder = vFolder
 				state.Files[i].CreatedAt = time.Now()
 				existsInDB = true
+				theFile = state.Files[i]
 				break
 			}
 		}
 
 		if !existsInDB {
-			newFile := FileData{
+			theFile = FileData{
 				ID:        uniqueID,
 				Name:      finalName,
 				Path:      absPath,
@@ -505,9 +603,12 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 				Tags:      tags,
 				CreatedAt: time.Now(),
 			}
-			state.Files = append(state.Files, newFile)
+			state.Files = append(state.Files, theFile)
 		}
 		state.mu.Unlock()
+		
+		// Yenilənmiş/Yüklənmiş faylı Bleve-yə yaz
+		go indexFileToBleve(theFile)
 
 		uploadedNames = append(uploadedNames, finalName)
 
@@ -575,7 +676,9 @@ func createNoteHandler(w http.ResponseWriter, r *http.Request) {
 	state.mu.Lock()
 	state.Files = append(state.Files, newFile)
 	state.mu.Unlock()
+	
 	go saveDB()
+	go indexFileToBleve(newFile) // Yeni Note yaradılan kimi indeksə yazılır
 
 	if isVersioned {
 		go broadcastEvent("Bu adda qeyd var idi, YENİ VERSİYASI yaradıldı: " + fileName)
@@ -727,6 +830,8 @@ func updateFileContentHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	
+	var updatedFileData FileData
 
 	state.mu.Lock()
 	if isVersioned {
@@ -745,13 +850,16 @@ func updateFileContentHandler(w http.ResponseWriter, r *http.Request) {
 			LastAccessed: time.Now(),
 		}
 		state.Files = append(state.Files, newFile)
+		updatedFileData = newFile
 	} else {
 		state.Files[fileIndex].LastAccessed = time.Now()
 		state.Files[fileIndex].CreatedAt = time.Now() 
+		updatedFileData = state.Files[fileIndex]
 	}
 	state.mu.Unlock()
 
 	go saveDB() 
+	go indexFileToBleve(updatedFileData) // Yenilənmiş məzmunu Bleve-yə yaz
 
 	if isVersioned {
 		go broadcastEvent("Fayl redaktə edildi və YENİ VERSİYA yaradıldı: " + finalName)
@@ -764,6 +872,7 @@ func updateFileContentHandler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	initStorage()
+	initSearchIndex() // BLEVE Başladılması
 	loadDB()
 	go autoStartupScan()
 
@@ -822,6 +931,9 @@ const uiHTML = `
         .drop-zone-active { z-index: 9999; opacity: 1; pointer-events: all; }
         .drop-zone-inactive { z-index: -1; opacity: 0; pointer-events: none; }
         
+        /* Snippet içindəki qalın mətnlər (Bleve mark) üçün */
+        mark { background-color: #fef08a; padding: 0 2px; border-radius: 2px; font-weight: bold; color: #b45309; }
+        
         /* Toast Animasiyaları */
         .toast-enter-active, .toast-leave-active { transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
         .toast-enter-from { opacity: 0; transform: translateX(50px); }
@@ -874,18 +986,20 @@ const uiHTML = `
                          class="absolute w-full left-0 mt-2 bg-white border border-slate-100 rounded-3xl shadow-2xl z-50 text-left flex flex-col custom-scroll py-2"
                          style="max-height: 40vh; overflow-y: auto;">
                         
-                        <div v-for="f in searchResults" :key="f.id" class="px-6 py-4 hover:bg-blue-50/50 flex justify-between items-center group cursor-pointer border-b border-slate-50 last:border-0 shrink-0">
-                            <div @click="openFile(f)" class="flex-1 flex items-center gap-4">
-                                <i data-lucide="file" class="w-5 h-5 text-slate-300 flex-shrink-0"></i>
-                                <div>
+                        <div v-for="f in searchResults" :key="f.id" class="px-6 py-4 hover:bg-blue-50/50 flex justify-between items-start group cursor-pointer border-b border-slate-50 last:border-0 shrink-0">
+                            <div @click="openFile(f)" class="flex-1 flex items-start gap-4">
+                                <i data-lucide="file" class="w-5 h-5 text-slate-300 flex-shrink-0 mt-0.5"></i>
+                                <div class="w-full min-w-0">
                                     <div class="text-sm font-medium break-words">{{ f.name }}</div>
-                                    <div class="flex gap-2 mt-1 flex-wrap">
+                                    <div v-if="f.snippet" class="text-xs text-slate-500 mt-1 italic leading-relaxed" v-html="f.snippet"></div>
+                                    
+                                    <div class="flex gap-2 mt-2 flex-wrap">
                                         <span v-for="t in f.tags" class="text-[9px] bg-blue-50 text-blue-500 px-2 py-0.5 rounded font-bold uppercase tracking-tighter">#{{ t }}</span>
                                         <span v-if="f.vFolder" class="text-[9px] bg-slate-100 text-slate-500 px-2 py-0.5 rounded font-bold uppercase tracking-tighter">{{ f.vFolder }}</span>
                                     </div>
                                 </div>
                             </div>
-                            <button @click.stop="startEdit(f)" class="p-2 opacity-0 group-hover:opacity-100 hover:bg-white shadow-sm rounded-full transition text-blue-600 flex-shrink-0">
+                            <button @click.stop="startEdit(f)" class="p-2 opacity-0 group-hover:opacity-100 hover:bg-white shadow-sm rounded-full transition text-blue-600 flex-shrink-0 ml-2">
                                 <i data-lucide="edit-3" class="w-4 h-4"></i>
                             </button>
                         </div>
