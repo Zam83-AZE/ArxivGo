@@ -186,18 +186,30 @@ func initStorage() {
 func initSearchIndex() {
 	var err error
 	if _, errStat := os.Stat(indexFolder); os.IsNotExist(errStat) {
+
+		// --- KOR İNDEKS (BLIND INDEX) KONSİQURASİYASI ---
+		textFieldMapping := bleve.NewTextFieldMapping()
+		textFieldMapping.Store = false              // MƏTNİ ÖZÜNDƏ SAXLAMA (GB-larla yerə qənaət)
+		textFieldMapping.IncludeTermVectors = false // Highlight (Snippet) vektorlarını ləğv et
+
+		docMapping := bleve.NewDocumentMapping()
+		docMapping.AddFieldMappingsAt("Content", textFieldMapping)
+
 		mapping := bleve.NewIndexMapping()
+		mapping.DefaultMapping = docMapping
+		// ------------------------------------------------
+
 		searchIndex, err = bleve.New(indexFolder, mapping)
 		if err != nil {
 			log.Fatalf("Bleve indeksi yaradıla bilmədi: %v", err)
 		}
-		fmt.Println("🌟 Yeni Bleve axtarış indeksi yaradıldı.")
+		fmt.Println("🌟 Yeni Yüngül (Kor) Bleve axtarış indeksi yaradıldı.")
 	} else {
 		searchIndex, err = bleve.Open(indexFolder)
 		if err != nil {
 			log.Fatalf("Bleve indeksi açıla bilmədi: %v", err)
 		}
-		fmt.Println("📦 Mövcud Bleve axtarış indeksi yükləndi.")
+		fmt.Println("📦 Mövcud Yüngül Bleve axtarış indeksi yükləndi.")
 	}
 }
 
@@ -454,7 +466,7 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if match {
-			ramResults[f.ID] = SearchResultItem{FileData: f, Snippet: ""} // Hələ kiçik mətn parçası (snippet) yoxdur
+			ramResults[f.ID] = SearchResultItem{FileData: f, Snippet: ""}
 		}
 	}
 	state.mu.RUnlock()
@@ -462,8 +474,7 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 	// 2. Bleve Mətn Axtarışı
 	bq := bleve.NewQueryStringQuery(queryText + "*")
 	searchRequest := bleve.NewSearchRequestOptions(bq, limit*2, 0, false)
-	searchRequest.Highlight = bleve.NewHighlightWithStyle("html")
-	searchRequest.Highlight.AddField("Content")
+	// QEYD: Highlight sildik çünki Kor İndeks mətni saxlamır.
 
 	searchResult, err := searchIndex.Search(searchRequest)
 
@@ -487,15 +498,11 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			snippetStr := ""
-			if fragments, ok := hit.Fragments["Content"]; ok && len(fragments) > 0 {
-				snippetStr = strings.Join(fragments, " ... ")
-			}
-
-			// Nəticəni yenilə (Bleve bizə Snippet qazandırdı)
+			// Kor İndeks olduğu üçün Bleve bizə snippet qaytara bilməz.
+			// Biz sadəcə xəbərdarlıq mətni çıxarırıq.
 			ramResults[hit.ID] = SearchResultItem{
 				FileData: fileData,
-				Snippet:  snippetStr,
+				Snippet:  "📌 Bu faylın məzmununda axtarılan söz var",
 			}
 		}
 		state.mu.RUnlock()
@@ -1125,7 +1132,7 @@ const uiHTML = `
                                 <i data-lucide="file" class="w-5 h-5 text-slate-300 flex-shrink-0 mt-0.5"></i>
                                 <div class="w-full min-w-0">
                                     <div class="text-sm font-medium break-words">{{ f.name }}</div>
-                                    <div v-if="f.snippet" class="text-xs text-slate-500 mt-1 italic leading-relaxed" v-html="f.snippet"></div>
+                                    <div v-if="f.snippet" class="text-xs text-blue-500 mt-1 italic leading-relaxed" v-html="f.snippet"></div>
                                     <div v-else-if="query && !f.indexed" class="text-[10px] text-orange-400 mt-1 italic leading-relaxed">Mətn hələ axtarış sisteminə yüklənir...</div>
                                     
                                     <div class="flex gap-2 mt-2 flex-wrap">
